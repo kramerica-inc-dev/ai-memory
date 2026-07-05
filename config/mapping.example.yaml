@@ -1,0 +1,36 @@
+# ── Content-layer config for the ingest/migration scripts ──
+#
+# Copy this file to  config/mapping.yaml  (gitignored) and adapt it to YOUR taxonomy.
+# It is the ONLY place where your namespaces and directory/project routing live — the
+# scripts read it instead of hard-coding names. Override the location with MAPPING_CONFIG.
+#
+# Nothing here is a secret; it is just how you slice your memory into namespaces.
+
+# Fallback group_id used when a source key matches nothing in group_map below.
+default_group: projects
+
+# The full set of valid namespaces (group_ids). Each group_id is a separate graph in
+# FalkorDB. verify_index.py checks landed episodes per group in this list. MCP clients
+# pass one of these per add_memory / search_* call so memory does not leak across areas.
+groups:
+  - work
+  - personal
+  - projects
+
+# Source key -> group_id.
+#
+# Consulted by two ingest adapters:
+#   - index_files.py : key = the top-level directory name under PROJECTS_DIR
+#                      (e.g. ~/Projects/work/... -> "work")
+#   - backfill.py    : key = the project/label of a claude-mem-style SQLite source
+#
+# Add one entry per directory or project you want routed to a specific namespace.
+# Anything not listed falls back to default_group.
+group_map:
+  work: work
+  personal: personal
+  projects: projects
+  # examples — replace with your own directory/project names:
+  my-work-project: work
+  my-side-app: projects
+  my-notes: personal

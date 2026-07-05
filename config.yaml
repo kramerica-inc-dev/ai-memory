@@ -1,0 +1,90 @@
+# Graphiti MCP — configuration (LLM + embedder + FalkorDB)
+# Mounted read-only into the container at /app/mcp/config/config.yaml.
+# ${VAR:default} = env var with a fallback; env comes from .env (see .env.example).
+
+server:
+  transport: "http"     # HTTP transport (SSE is deprecated)
+  host: "0.0.0.0"
+  port: 8000
+
+llm:
+  # Extraction LLM. Provider is env-driven (LLM_PROVIDER, set by profiles/*.env or
+  # `memctl switch`) so swapping providers is just an env change + restart — no config edit.
+  # The config loader expands ${VAR:default} on the provider: string too. Always give a default.
+  #
+  # Note on OpenAI-compatible endpoints: graphiti's factory does not pass base_url through the
+  # yaml, so the OPENAI_BASE_URL env (docker-compose) decides the actual endpoint. Some standalone
+  # images use the OpenAI Responses API, which not every OpenAI-compatible gateway implements —
+  # verify your gateway (or use native providers). See ARCHITECTURE.md.
+  provider: "${LLM_PROVIDER:openai}"
+  # The model names in this repo are examples/defaults — you pick your own provider + model via
+  # profiles/*.env or env (see "Choosing your models" in docs/DEPLOY.md). A small/fast model is
+  # fine here; extraction needs no deep reasoning.
+  model: ${MODEL_NAME:gpt-5.4-mini}
+  max_tokens: 4096
+  temperature: null       # some reasoning models reject temperature -> leave it out
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY}
+      # api_url default = https://api.openai.com/v1. NOTE: graphiti's factory does not pass
+      # base_url through, so the OPENAI_BASE_URL env (docker-compose) decides the endpoint.
+    anthropic:
+      api_key: ${ANTHROPIC_API_KEY}
+      api_url: ${ANTHROPIC_API_URL:https://api.anthropic.com}
+      max_retries: 3
+    gemini:
+      api_key: ${GOOGLE_API_KEY}
+      project_id: ${GOOGLE_PROJECT_ID:}
+      location: ${GOOGLE_LOCATION:us-central1}
+
+embedder:
+  # Env-driven: EMBEDDER_PROVIDER (profiles/*.env). ALWAYS write it with a default — an empty
+  # expansion would otherwise fall back to the Pydantic field default. Changing the embedder =
+  # a full reindex (the dimension is baked into the vector index): use `memctl reindex`, not switch.
+  provider: "${EMBEDDER_PROVIDER:gemini}"
+  model: ${EMBEDDER_MODEL:gemini-embedding-001}
+  dimensions: ${EMBEDDER_DIMENSIONS:768}
+  providers:
+    gemini:
+      api_key: ${GOOGLE_API_KEY}
+      project_id: ${GOOGLE_PROJECT_ID:}
+      location: ${GOOGLE_LOCATION:us-central1}
+    openai:
+      # Local OpenAI-compatible embeddings endpoint (e.g. infinity/bge-m3, or Ollama). Active only
+      # when EMBEDDER_PROVIDER=openai (profiles/local-embedder.env). Separate base_url from the LLM:
+      # graphiti's embedder factory DOES pass this api_url through. api_key may be a dummy value.
+      api_key: ${EMBEDDER_OPENAI_KEY:local}
+      api_url: ${EMBEDDER_OPENAI_URL:http://infinity:7997}
+
+database:
+  provider: "falkordb"
+  providers:
+    falkordb:
+      uri: ${FALKORDB_URI:redis://falkordb:6379}
+      password: ${FALKORDB_PASSWORD:}
+      database: ${FALKORDB_DATABASE:default_db}
+
+graphiti:
+  # Default namespace; MCP clients pass their own group_id per call so memory does not leak
+  # across areas. Your namespaces (group_ids) live in config/mapping.yaml — see clients/README.md.
+  group_id: ${GRAPHITI_GROUP_ID:main}
+  user_id: ${USER_ID:default-user}
+  entity_types:
+    - name: "Preference"
+      description: "Preferences, choices, opinions (prioritize over most other types)"
+    - name: "Requirement"
+      description: "Concrete requirements, features or functionality that must be fulfilled"
+    - name: "Procedure"
+      description: "Standard ways of working and sequential instructions"
+    - name: "Location"
+      description: "Physical or virtual places where activities happen"
+    - name: "Event"
+      description: "Time-bound activities, events or experiences"
+    - name: "Organization"
+      description: "Companies, institutions, groups or formal entities"
+    - name: "Document"
+      description: "Information content in various forms (reports, articles, notes)"
+    - name: "Topic"
+      description: "Subject of conversation, interest or knowledge domain (last resort)"
+    - name: "Object"
+      description: "Physical items, tools, devices or possessions (last resort)"

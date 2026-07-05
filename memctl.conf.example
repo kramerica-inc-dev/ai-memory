@@ -1,0 +1,18 @@
+# Copy to memctl.conf (gitignored) and fill in YOUR deployment. No secrets belong here.
+#
+# Remote deploy over SSH (leave MEMORY_HOST empty to operate on a LOCAL docker instead):
+MEMORY_HOST=user@your-memory-host
+MEMORY_DIR=/opt/ai-memory
+#
+# Your memory namespaces (group_ids) — must match config/mapping.yaml 'groups':
+MEMORY_GROUPS="work personal projects"
+#
+# Endpoints used by the migrate/ ingest scripts during `memctl reindex`:
+MCP_URL=http://your-memory-host:8000/mcp
+SANITIZER_URL=http://your-sanitizer:8080
+#
+# Optional overrides (defaults shown):
+# COMPOSE="docker compose"
+# FALKOR_SVC=ai-memory-falkordb-1
+# MCP_SVC=ai-memory-graphiti-mcp-1
+# MCP_COMPOSE_SVC=graphiti-mcp

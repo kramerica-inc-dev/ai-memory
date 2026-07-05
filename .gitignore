@@ -1,0 +1,34 @@
+# ── Secrets & local runtime state — NEVER commit ──
+.env
+.env.active
+.env.*.local
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*.p12
+*.keystore
+*.pfx
+
+# ── Content layer (your namespaces/routing) & runtime markers ──
+# The tool is form-only; your content-specific config stays local.
+memctl.conf
+.active-profile
+config/mapping.yaml
+
+# ── Data, backups, ingest ledgers/locks ──
+data/
+backups/
+migrate/.indexed.json
+migrate/.indexed.lock
+migrate/.backfilled.txt
+*.log
+
+# ── Python ──
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ── OS/editor cruft ──
+.DS_Store

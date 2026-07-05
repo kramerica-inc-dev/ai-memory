@@ -1,0 +1,26 @@
+# Reverse proxy in front of graphiti-mcp.
+# The MCP/FastMCP transport has DNS-rebinding protection: it only accepts
+# Host: localhost/127.0.0.1. Clients over a tailnet send Host: <host-ip>:8000 and
+# would otherwise be rejected (421 Invalid Host header). Caddy rewrites the Host to
+# localhost:8000 and strips Origin so any MCP client can connect.
+
+{
+	admin off
+	auto_https off
+}
+
+:8000 {
+	reverse_proxy graphiti-mcp:8000 {
+		header_up Host localhost:8000
+		header_up -Origin
+		flush_interval -1
+	}
+}
+
+# OPTIONAL sanitizer proxy: exposes an external secret-sanitizer (running elsewhere on your
+# LAN) to your clients over the tailnet, so the ingest scripts can reach it via SANITIZER_URL.
+# Only relevant if you run a separate sanitizer service; otherwise delete this block and the
+# 8080 port mapping in docker-compose.yml. Replace the upstream with your sanitizer's host:port.
+:8080 {
+	reverse_proxy your-sanitizer-host:3100
+}

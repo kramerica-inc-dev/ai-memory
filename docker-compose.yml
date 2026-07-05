@@ -1,0 +1,121 @@
+# Platform-independent AI memory — Graphiti MCP + FalkorDB
+# One shared, self-hosted temporal knowledge graph, reachable by all MCP clients.
+#
+# Deploy (on a server or locally):   docker compose up -d
+# Healthcheck:                       curl http://<host>:8000/mcp/
+#
+# Security:
+#   - FalkorDB (6379) and the Browser UI (3000) are NOT published to the host:
+#     only the graphiti-mcp container talks to them over the internal compose network.
+#   - Only port 8000 (MCP/HTTP) is reachable — intended for a PRIVATE network (e.g. a
+#     Tailscale/WireGuard tailnet), not the public internet. See docs/DEPLOY.md for
+#     hardening (reverse proxy + bearer auth) if you must expose it beyond the tailnet.
+
+services:
+  falkordb:
+    # Pin to a digest after the first pull — see docs/DEPLOY.md (FALKORDB_IMAGE in .env).
+    image: ${FALKORDB_IMAGE:-falkordb/falkordb:latest}
+    restart: unless-stopped
+    environment:
+      # FalkorDB enforces the password via standard redis (the image does not honor FALKORDB_PASSWORD itself)
+      - REDIS_ARGS=--requirepass ${FALKORDB_PASSWORD}
+      - BROWSER=${BROWSER:-0}          # Browser UI off by default (0). Set to 1 for debug.
+      # Module load args. The image default sets the DEPRECATED `TIMEOUT 1000` = a hard 1s limit on
+      # READ queries -> graphiti's dedup fulltext queries (~1s, growing with the graph) fail with
+      # "Query timed out". Replaced by the newer mechanism: TIMEOUT_DEFAULT 60s / TIMEOUT_MAX 120s
+      # (which do not coexist with the deprecated TIMEOUT, so we leave that out). See docs/DEPLOY.md.
+      - FALKORDB_ARGS=${FALKORDB_ARGS:-MAX_QUEUED_QUERIES 25 TIMEOUT_DEFAULT 60000 TIMEOUT_MAX 120000 RESULTSET_SIZE 10000}
+    expose:
+      - "6379"                          # internal only, for graphiti-mcp
+    volumes:
+      - ${FALKORDB_DATA:-./data/falkordb}:/var/lib/falkordb/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "-a", "${FALKORDB_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  graphiti-mcp:
+    # Locally built image = a standalone knowledge-graph-mcp image + native provider SDKs.
+    # See Dockerfile.
+    image: ai-memory-graphiti-mcp:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    environment:
+      # ── Database ──
+      - FALKORDB_URI=${FALKORDB_URI:-redis://falkordb:6379}
+      - FALKORDB_PASSWORD=${FALKORDB_PASSWORD:-}
+      - FALKORDB_DATABASE=${FALKORDB_DATABASE:-default_db}
+      # ── App ──
+      - GRAPHITI_GROUP_ID=${GRAPHITI_GROUP_ID:-main}   # default namespace; clients override per call
+      # Concurrency of the ingest queue. Keep it under your slowest provider's rate limit
+      # (often the embedder). Raising it increases bulk-index throughput. Takes effect only AFTER a
+      # restart of graphiti-mcp (the queue is in-memory -> drain it first, else queued episodes drop).
+      - SEMAPHORE_LIMIT=${SEMAPHORE_LIMIT:-8}
+      - GRAPHITI_TELEMETRY_ENABLED=${GRAPHITI_TELEMETRY_ENABLED:-false}
+      - CONFIG_PATH=/app/mcp/config/config.yaml
+      - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      # ── Provider selection (env-driven; profiles/*.env or `memctl switch` set these) ──
+      # The config loader expands ${VAR:default} on the provider: string in config.yaml too,
+      # so switching = these env vars + restart, no config edit. Always pass defaults.
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - EMBEDDER_PROVIDER=${EMBEDDER_PROVIDER:-gemini}
+      # graphiti's factory does not pass base_url through -> OPENAI_BASE_URL decides the LLM endpoint.
+      # OPENAI_* also covers the reranker/cross-encoder, which gets no yaml config.
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_API_URL:-https://api.openai.com/v1}
+      - MODEL_NAME=${MODEL_NAME:-gpt-5.4-mini}   # example default; override via profiles/env
+      - EMBEDDER_MODEL=${EMBEDDER_MODEL:-gemini-embedding-001}
+      - EMBEDDER_DIMENSIONS=${EMBEDDER_DIMENSIONS:-768}
+      # Local embeddings endpoint (infinity) — used only when EMBEDDER_PROVIDER=openai.
+      - EMBEDDER_OPENAI_URL=${EMBEDDER_OPENAI_URL:-http://infinity:7997}
+      - EMBEDDER_OPENAI_KEY=${EMBEDDER_OPENAI_KEY:-local}
+      # MUST match the embedder dimension, else vector search breaks after a FalkorDB restart
+      - EMBEDDING_DIM=${EMBEDDER_DIMENSIONS:-768}
+    volumes:
+      - ./config.yaml:/app/mcp/config/config.yaml:ro
+    expose:
+      - "8000"                             # internal; Caddy publishes to the tailnet
+    command: ["uv", "run", "main.py"]
+
+  # Local, vendor-free embeddings server (bge-m3, OpenAI-compatible). CPU-only, internal only.
+  # The graphiti-mcp embedder points at it via config.yaml (embedder.providers.openai.api_url)
+  # when EMBEDDER_PROVIDER=openai — see profiles/local-embedder.env. The model cache persists in
+  # a volume so the ~2.3GB download happens once. Optional: only needed for a local embedder.
+  infinity:
+    image: ${INFINITY_IMAGE:-michaelf34/infinity:latest}
+    restart: unless-stopped
+    # CPU-only hosts: skip the model warmup/timing sweep (hangs on some CPUs) and the deprecated
+    # bettertransformer optimization; otherwise the server may fail to bind.
+    command: ["v2", "--model-id", "${INFINITY_MODEL:-BAAI/bge-m3}", "--port", "7997",
+              "--device", "cpu", "--no-bettertransformer", "--no-model-warmup"]
+    environment:
+      - HF_HOME=/cache
+    volumes:
+      - ${INFINITY_CACHE:-./data/infinity}:/cache
+    expose:
+      - "7997"                          # internal only, for graphiti-mcp
+
+  # Reverse proxy: rewrites the Host header to localhost so MCP clients over the tailnet do not
+  # trip the DNS-rebinding protection. The only published port.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - graphiti-mcp
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "${MCP_BIND:-0.0.0.0}:8000:8000"   # MCP/HTTP — reachable on the tailnet
+      # Optional: only if you proxy an external sanitizer through this host (see Caddyfile).
+      - "${MCP_BIND:-0.0.0.0}:8080:8080"
