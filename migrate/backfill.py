@@ -37,7 +37,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))          # mapping_config.py
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # sanitize_ingest.py
 from sanitize_ingest import sanitize, SanitizerError  # noqa: E402
-from mapping_config import load_mapping                # noqa: E402
+from mapping_config import load_mapping, apply_conf    # noqa: E402
+
+apply_conf()   # memctl.conf as env defaults (explicit env still wins) — parity with the shell tools
 
 MCP_URL = os.environ.get("MCP_URL", "http://localhost:8000/mcp")
 CLAUDE_MEM_DB = os.environ.get("CLAUDE_MEM_DB", str(Path.home() / ".claude-mem" / "claude-mem.db"))

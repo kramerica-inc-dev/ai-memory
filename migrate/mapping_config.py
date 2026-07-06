@@ -25,10 +25,35 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / "config" / "mapping.yaml"
+DEFAULT_CONF = REPO_ROOT / "memctl.conf"
 
 
 class MappingConfigError(RuntimeError):
     """The mapping config is missing or malformed — ingest is blocked."""
+
+
+def apply_conf(path: str | os.PathLike | None = None) -> None:
+    """Load KEY=VALUE pairs from memctl.conf into os.environ as *defaults*.
+
+    memctl.sh and backup.sh source memctl.conf; the Python ingest tools call this so a
+    bare `python3 migrate/<tool>.py` honors the same deployment config (MEMORY_HOST,
+    MCP_URL, SANITIZER_URL, ARTIFACTS_DIR, …) without re-exporting. Existing environment
+    variables always win, so explicit overrides keep working. Override the file location
+    with MEMCTL_CONF. Missing file = no-op (env/defaults apply, same as the shell tools).
+    """
+    cfg = Path(path or os.environ.get("MEMCTL_CONF") or DEFAULT_CONF)
+    if not cfg.exists():
+        return
+    for raw in cfg.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = val
 
 
 class Mapping:

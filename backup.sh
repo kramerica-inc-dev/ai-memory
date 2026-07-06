@@ -33,9 +33,20 @@ set -a; . "\$DIR/.env"; set +a
 D="$DOCKER"
 FALKOR="$FALKOR_SVC"
 
-# 1) force a snapshot to dump.rdb
+# 1) force a snapshot to dump.rdb and WAIT until it completes (LASTSAVE changes).
+#    A fixed sleep silently copies the PREVIOUS dump when the save takes longer.
+LAST=\$("\$D" exec "\$FALKOR" redis-cli -a "\$FALKORDB_PASSWORD" --no-auth-warning LASTSAVE)
 "\$D" exec "\$FALKOR" redis-cli -a "\$FALKORDB_PASSWORD" --no-auth-warning BGSAVE >/dev/null
-sleep 4
+NOW="\$LAST"
+for _ in \$(seq 1 60); do
+  sleep 2
+  NOW=\$("\$D" exec "\$FALKOR" redis-cli -a "\$FALKORDB_PASSWORD" --no-auth-warning LASTSAVE)
+  [ "\$NOW" != "\$LAST" ] && break
+done
+if [ "\$NOW" = "\$LAST" ]; then
+  echo "BGSAVE did not complete within 120s — aborting, no copy made" >&2
+  exit 1
+fi
 
 # 2) timestamped copy + retention
 mkdir -p "\$DIR/backups"

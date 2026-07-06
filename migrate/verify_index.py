@@ -39,7 +39,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Reuse extraction+chunking to recompute the EXPECTED chunk count (rather than trusting the
 # ledger: it records the WRITTEN count, so a sanitizer skip under-counts there).
 from index_files import extract_text, chunk_text, PROJECTS  # noqa: E402
-from mapping_config import load_mapping                       # noqa: E402
+from mapping_config import load_mapping, apply_conf           # noqa: E402
+
+apply_conf()   # memctl.conf as env defaults (explicit env still wins) — parity with the shell tools
 
 LEDGER = Path(__file__).resolve().parent / ".indexed.json"
 ARTIFACTS = os.environ.get("ARTIFACTS_DIR", "/opt/ai-memory/artifacts")

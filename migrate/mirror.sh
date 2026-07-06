@@ -22,9 +22,14 @@
 # Override via env: SRC, DEST_HOST, DEST_PATH, MAX_SIZE, RSYNC_PATH.
 set -euo pipefail
 
-SRC="${SRC:-$HOME/Projects/}"                                   # trailing slash = contents, not the dir
-DEST_HOST="${DEST_HOST:-user@your-memory-host}"                 # SSH target
-DEST_PATH="${DEST_PATH:-/opt/ai-memory/artifacts/}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# memctl.conf (next to the repo root) provides deployment defaults; explicit env wins.
+# shellcheck disable=SC1091
+[ -f "$SCRIPT_DIR/../memctl.conf" ] && . "$SCRIPT_DIR/../memctl.conf"
+
+SRC="${SRC:-${PROJECTS_DIR:-$HOME/Projects}/}"                  # trailing slash = contents, not the dir
+DEST_HOST="${DEST_HOST:-${MEMORY_HOST:-user@your-memory-host}}" # SSH target
+DEST_PATH="${DEST_PATH:-${ARTIFACTS_DIR:-/opt/ai-memory/artifacts}/}"
 MAX_SIZE="${MAX_SIZE:-100m}"                                    # guardrail against accidental big binaries
 RSYNC_PATH="${RSYNC_PATH:-rsync}"                              # rsync path ON the host (non-interactive PATH)
 

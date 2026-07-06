@@ -42,7 +42,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))          # backfill.py,
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # sanitize_ingest.py
 from backfill import MCPClient                                     # noqa: E402
 from sanitize_ingest import sanitize, SanitizerError               # noqa: E402
-from mapping_config import load_mapping                            # noqa: E402
+from mapping_config import load_mapping, apply_conf                # noqa: E402
+
+apply_conf()   # memctl.conf as env defaults (explicit env still wins) — parity with the shell tools
 
 PROJECTS = Path(os.environ.get("PROJECTS_DIR", str(Path.home() / "Projects")))
 # Where the mirror places files on the memory host — used only to build the artifact:
