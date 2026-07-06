@@ -22,9 +22,11 @@ services:
       - BROWSER=${BROWSER:-0}          # Browser UI off by default (0). Set to 1 for debug.
       # Module load args. The image default sets the DEPRECATED `TIMEOUT 1000` = a hard 1s limit on
       # READ queries -> graphiti's dedup fulltext queries (~1s, growing with the graph) fail with
-      # "Query timed out". Replaced by the newer mechanism: TIMEOUT_DEFAULT 60s / TIMEOUT_MAX 120s
-      # (which do not coexist with the deprecated TIMEOUT, so we leave that out). See docs/DEPLOY.md.
-      - FALKORDB_ARGS=${FALKORDB_ARGS:-MAX_QUEUED_QUERIES 25 TIMEOUT_DEFAULT 60000 TIMEOUT_MAX 120000 RESULTSET_SIZE 10000}
+      # "Query timed out". Use the newer mechanism instead (it does not coexist with the deprecated
+      # TIMEOUT, so that is left out). NOTE: dedup queries scale poorly with group size — on a large
+      # group (200+ episodes) a single add_episode can take minutes, so the timeouts are generous
+      # (5 min default / 10 min max) to avoid dropping episodes mid-ingest. See docs/DEPLOY.md.
+      - FALKORDB_ARGS=${FALKORDB_ARGS:-MAX_QUEUED_QUERIES 500 TIMEOUT_DEFAULT 300000 TIMEOUT_MAX 600000 RESULTSET_SIZE 10000}
     expose:
       - "6379"                          # internal only, for graphiti-mcp
     volumes:
