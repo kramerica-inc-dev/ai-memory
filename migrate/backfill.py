@@ -8,8 +8,10 @@ Sources (both are examples of "onboard an existing store"; adapt to yours):
 
 Every episode first goes through the secret-sanitizer (depth 'quick': strip credentials
 but keep names/locations/projects) and is then written via the MCP add_memory tool into
-Graphiti. Idempotent through a local ledger (migrate/.backfilled.txt): re-runs skip
-already-done source items. add_memory is NOT given a uuid (that is for updates, not new).
+Graphiti with a stable unique key in source_description (e.g. "claude-mem:summary:<id>"),
+so every episode is uniquely identifiable and analyzable. Idempotent through a local ledger
+(migrate/.backfilled.txt) plus that key: re-runs skip already-done source items and never
+duplicate. add_memory is NOT given a uuid (a provided uuid means "update an existing node").
 
 Namespace routing (which area a source item lands in) comes from the content-layer config
 (config/mapping.yaml — see config/mapping.example.yaml), never from this script.
@@ -173,14 +175,17 @@ def run(source, limit, dry_run, do_sanitize, delay):
     if not dry_run:
         client = MCPClient(MCP_URL)
         client.initialize()
-        # Reconcile: mark items already present in the graph (name match via get_episodes)
-        # as done. This way only truly-landed episodes count; 503 failures stay open and are
-        # retried on a later run — without duplicates.
+        # Reconcile: mark items already present in the graph as done. Match on the STABLE
+        # UNIQUE key (source_description == e["key"]), NOT on name: a name can be a title
+        # truncated to 80 chars that collides across distinct source items, which caused both
+        # false hits (skip genuinely-missing items) and false misses (duplicate landed items).
+        # Note: get_episodes is init-dependent and may return an incomplete set — the ledger
+        # (_mark_done after each successful add) is therefore the primary idempotency guard.
         pending = [e for e in eps if e["key"] not in done]
         for g in {e["group_id"] for e in pending}:
-            names = {ep.get("name", "") for ep in client.get_episodes(g)}
+            keys_in_graph = {ep.get("source_description", "") for ep in client.get_episodes(g)}
             for e in pending:
-                if e["group_id"] == g and e["name"] in names and e["key"] not in done:
+                if e["group_id"] == g and e["key"] in keys_in_graph and e["key"] not in done:
                     _mark_done(e["key"]); done.add(e["key"])
 
     todo = [e for e in eps if e["key"] not in done]
@@ -209,7 +214,11 @@ def run(source, limit, dry_run, do_sanitize, delay):
                 skipped += 1
                 continue
         try:
-            client.add_memory(e["name"], body, e["group_id"])
+            # source_description = the stable unique key -> every episode is uniquely
+            # identifiable/analyzable and reconciles collision-free (same convention as the
+            # file/artifact route: "markdown:<name>" / "claude-mem:summary:<id>").
+            client.add_memory(e["name"], body, e["group_id"], source_description=e["key"])
+            _mark_done(e["key"]); done.add(e["key"])   # ledger = primary idempotency
             ok += 1
             if i % 10 == 0 or i == len(todo):
                 print(f"  {i}/{len(todo)} queued…")
