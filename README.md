@@ -100,6 +100,17 @@ graph. `migrate/verify_index.py` checks that queued chunks actually landed.
 - **Secrets never enter the graph.** Detected secrets go to a dedicated secret manager; only an
   opaque reference is stored in memory. See "Secret management" in `docs/DEPLOY.md` for the pattern.
 
+## Credits
+
+Built on the shoulders of these open-source projects:
+
+- **[Graphiti](https://github.com/getzep/graphiti)** — the temporal knowledge-graph engine (episodes, entities, facts) this project wraps and operates.
+- **[FalkorDB](https://github.com/FalkorDB/FalkorDB)** — the graph database backing the store.
+- **[Infinity](https://github.com/michaelf34/infinity)** — the OpenAI-compatible embeddings server, running **[BAAI/bge-m3](https://huggingface.co/BAAI/bge-m3)** as the vendor-free embedding model.
+- **[secret-sanitizer](https://github.com/kramerica-inc-dev/secret-sanitizer)** — the hygiene gate that strips secrets/PII before ingest (itself built on Betterleaks/Gitleaks, Presidio and Deduce).
+- **[Caddy](https://github.com/caddyserver/caddy)** — the reverse proxy in front of the MCP endpoint.
+- **[Model Context Protocol](https://github.com/modelcontextprotocol)** — the client-agnostic protocol every MCP client speaks.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
