@@ -51,7 +51,8 @@ PROCESSED = "aimem:processed"
 DEAD = "aimem:dead"
 HEARTBEAT = "aimem:heartbeat:bulk"
 CONSUMER_HB = "aimem:heartbeat:consumer"
-LOCK_TTL = 600            # seconds; refreshed at half-life, so a crash frees it in <=10min
+LOCK_TTL = 240            # seconds; refreshed at half-life, so a crash/kill frees it in <=4min
+                          # (the finally-block releases it immediately on a clean/handled exit)
 MAX_BATCH_ATTEMPTS = 3    # transient failures get retried before dead-lettering
 TRANSIENT = ("rate limit", "429", "timeout", "timed out", "connection",
              "overloaded", "503", "529", "temporarily")

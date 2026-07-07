@@ -274,7 +274,11 @@ cmd_wipe() {
   echo "  [2/3] wipe graphs"; for g in $targets; do redis_query "$g" "MATCH (n) DETACH DELETE n" >/dev/null; echo "    wiped $g"; done
   echo "  [3/3] clear durable-queue state"
   redis_cmd "DEL aimem:processed" >/dev/null; redis_cmd "DEL aimem:queue" >/dev/null; redis_cmd "DEL aimem:dead" >/dev/null
-  echo "    cleared aimem:processed / aimem:queue / aimem:dead"
+  # DEL aimem:queue drops the consumer group -> the live consumer would loop on NOGROUP until it
+  # self-heals. Recreate the empty stream+group here so it never even notices (BUSYGROUP = fine).
+  redis_cmd "XGROUP CREATE aimem:queue workers 0 MKSTREAM" >/dev/null 2>&1 || true
+  redis_cmd "DEL aimem:writer-lock" >/dev/null
+  echo "    cleared aimem:processed / aimem:queue / aimem:dead; recreated queue group; freed writer-lock"
   echo "✓ wipe complete. Verify with migrate/reconcile.py (all groups empty, backlog/dead 0)."
 }
 

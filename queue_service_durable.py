@@ -249,6 +249,20 @@ class QueueService:
                 logger.info('Durable queue consumer cancelled')
                 return
             except Exception as e:  # noqa: BLE001 — consumer must never die
+                # Self-heal the stream/group if it was deleted out from under us (a graph wipe
+                # or `memctl wipe` DELs aimem:queue, which drops the consumer group -> every
+                # xreadgroup then errors NOGROUP forever). Recreate it and carry on.
+                if 'NOGROUP' in str(e):
+                    try:
+                        await self._redis.xgroup_create(STREAM, GROUP, id='0', mkstream=True)
+                        cursor = '>'
+                        logger.warning(f'Recreated missing stream/group {STREAM}/{GROUP} (was DELeted); resuming')
+                        continue
+                    except Exception as e2:  # noqa: BLE001
+                        if 'BUSYGROUP' in str(e2):
+                            cursor = '>'
+                            continue
+                        logger.error(f'Failed to recreate {STREAM}/{GROUP}: {e2}')
                 logger.error(f'Queue consumer error (continuing): {e}')
                 await asyncio.sleep(5)
 
