@@ -20,9 +20,17 @@ Global:
   4. embedding-space drift — the `aimem:embedding_space` marker (written by
      memctl switch/reindex) vs the live embedder env. CRITICAL on mismatch: stored
      vectors are invalid for the live embedder; searches will silently degrade.
+  5. dead-letter depth — episodes parked in `aimem:dead` after exhausting their
+     retries (durable queue). They are safe but INERT until an operator inspects
+     and replays them; any nonzero count is a finding.
+  6. queue backlog — `aimem:queue` length above QUEUE_BACKLOG_WARN (default 50)
+     means the consumer is stalled or the provider is degraded.
+  7. reachability — FalkorDB must answer PING; an unreachable DB is CRITICAL
+     (a monitoring run that cannot observe anything must not report green).
 
 Artifact-level reconciliation (ledger vs landed chunks) lives in verify_index.py —
 run that alongside this when artifact completeness matters.
+For scheduling, reconcile-cron.sh wraps this with logging + a DSM notification.
 
 Exit codes: 0 = clean · 1 = findings (fixable/informational) · 2 = critical.
 
@@ -57,6 +65,9 @@ DOCKER = os.environ.get("DOCKER", "docker")
 FALKOR_SVC = os.environ.get("FALKOR_SVC", "ai-memory-falkordb-1")
 MCP_SVC = os.environ.get("MCP_SVC", "ai-memory-graphiti-mcp-1")
 SPACE_KEY = "aimem:embedding_space"
+QUEUE_STREAM = "aimem:queue"
+DEAD_STREAM = "aimem:dead"
+BACKLOG_WARN = int(os.environ.get("QUEUE_BACKLOG_WARN", "50"))
 
 
 def _onhost(cmd: str, timeout: int = 40) -> str:
@@ -106,6 +117,10 @@ def main(argv) -> int:
     findings = 0
     critical = 0
 
+    if "PONG" not in _redis("PING"):
+        print("✗ CRITICAL: FalkorDB unreachable (no PONG) — nothing can be verified")
+        return 2
+
     print("▸ reconcile — invariants per namespace")
     for g in groups:
         foreign = _graph_count(
@@ -126,6 +141,22 @@ def main(argv) -> int:
         if pending:
             findings += 1
         print(line)
+
+    # write-path health (durable queue) — surface parked/stalled work early
+    dead_raw = _redis(f"XLEN {DEAD_STREAM}").strip()
+    queue_raw = _redis(f"XLEN {QUEUE_STREAM}").strip()
+    dead = int(dead_raw) if dead_raw.isdigit() else None
+    queued = int(queue_raw) if queue_raw.isdigit() else None
+    print(f"  queue: backlog={queued if queued is not None else '?'}  "
+          f"dead-letter={dead if dead is not None else '?'}")
+    if dead:
+        print(f"  ✗ DEAD-LETTER: {dead} episode(s) parked in {DEAD_STREAM} — not lost, but "
+              f"inert until replayed (inspect: XRANGE {DEAD_STREAM} - +)")
+        findings += 1
+    if queued is not None and queued > BACKLOG_WARN:
+        print(f"  ✗ BACKLOG: {queued} queued episodes (> {BACKLOG_WARN}) — consumer stalled "
+              f"or provider degraded; check the graphiti-mcp logs")
+        findings += 1
 
     marker = _redis(f"GET {SPACE_KEY}").strip()
     live = _live_embedder()
