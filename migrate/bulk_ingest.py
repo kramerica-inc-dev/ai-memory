@@ -141,6 +141,34 @@ async def heartbeat(r: aioredis.Redis, **fields) -> None:
         pass
 
 
+async def check_embedder(g) -> None:
+    """Reachability gate: a dead embedder (e.g. infinity down) would make every batch fail
+    and mass dead-letter a whole drain. Do one tiny embed up front; abort loudly if it fails.
+    Provider-agnostic (uses the same embedder the ingest will use)."""
+    await g.embedder.create("ai-memory embedder health check")
+
+
+async def graph_episode_count(r, grp: str) -> int | None:
+    """Episodic-node count for a group, for the post-ingest completeness check."""
+    try:
+        reply = await r.execute_command(
+            "GRAPH.RO_QUERY", grp, "MATCH (e:Episodic) RETURN count(e)")
+    except Exception:  # noqa: BLE001
+        return None
+    stack = [reply]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, int):
+            return x
+        if isinstance(x, (list, tuple)):
+            stack.extend(x)
+        elif isinstance(x, (bytes, str)):
+            s = x.decode() if isinstance(x, bytes) else x
+            if s.lstrip("-").isdigit():
+                return int(s)
+    return None
+
+
 def build_client():
     """Build a Graphiti client exactly like the MCP server (same config/factories)."""
     config = GraphitiConfig()
@@ -227,9 +255,17 @@ async def main():
         g, custom, config = build_client()
         print(f"provider={config.llm.provider}/{config.llm.model}  "
               f"embedder={config.embedder.provider}/{config.embedder.model}/{config.embedder.dimensions}")
+        try:
+            await check_embedder(g)
+            print("✓ embedder reachable")
+        except Exception as exc:  # noqa: BLE001
+            print(f"✗ embedder unreachable ({type(exc).__name__}: {str(exc)[:120]}) — aborting "
+                  f"before a drain that would mass dead-letter. Fix it and retry.", file=sys.stderr)
+            return 2
         print(f"groups: { {k: len(v) for k, v in recs.items()} }")
         now = datetime.now(timezone.utc)
         grand_dead = 0
+        gaps = 0
 
         for grp, items in recs.items():
             print(f"[{grp}] {len(items)} chunks -> bulk in batches of {a.batch}")
@@ -244,12 +280,24 @@ async def main():
                 print(f"  [{grp}] {done + skipped + dead}/{len(items)}  "
                       f"(+{n} nodes, +{e} edges; skipped={skipped}, dead={dead})")
             grand_dead += dead
+            # Accounting invariant: every input record is ingested, skipped, or dead-lettered.
+            if done + skipped + dead != len(items):
+                gaps += 1
+                print(f"  [{grp}] ✗ ACCOUNTING GAP: ingested+skipped+dead="
+                      f"{done + skipped + dead} != input {len(items)}")
+            # Completeness: on a fresh group the landed episode count must cover this run.
+            landed = await graph_episode_count(r, grp)
+            if landed is not None and landed < done:
+                gaps += 1
+                print(f"  [{grp}] ✗ SILENT DROP: only {landed} episodes in the graph "
+                      f"but {done} ingested this run (graphiti dropped some)")
             print(f"[{grp}] done: ingested={done}, skipped={skipped}, dead={dead}, "
+                  f"landed_in_graph={landed if landed is not None else '?'}, "
                   f"{tot_nodes} nodes, {tot_edges} edges")
 
         await heartbeat(r, state="done", dead=grand_dead)
-        print(f"BULK DONE (dead-lettered={grand_dead})")
-        return 3 if grand_dead else 0
+        print(f"BULK DONE (dead-lettered={grand_dead}, gaps={gaps})")
+        return 3 if (grand_dead or gaps) else 0
     finally:
         refresher.cancel()
         await release_lock(r, owner)

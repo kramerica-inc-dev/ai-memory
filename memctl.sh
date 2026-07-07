@@ -21,6 +21,8 @@
 #   ./memctl.sh switch <profile>
 #   ./memctl.sh reindex --to <profile> [--groups a,b,c] [--dry-run] [--yes]
 #   ./memctl.sh ingest <chunks.jsonl> [--groups a,b] [--batch N]
+#   ./memctl.sh dead-letter --list | --replay [--reason R] [--group G] | --purge --yes
+#   ./memctl.sh wipe [--groups a,b] [--yes]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -238,11 +240,51 @@ cmd_ingest() {
   onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/bulk_ingest.py $args"
 }
 
+# ── dead-letter: inspect / replay the quarantine stream (ships the tool into the container) ──
+cmd_deadletter() {
+  if [ -n "$MEMORY_HOST" ]; then
+    # shellcheck disable=SC2086
+    scp -O ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$SCRIPT_DIR/migrate/dead_letter.py" "$MEMORY_HOST:$MEMORY_DIR/dead_letter.py"
+  else
+    cp "$SCRIPT_DIR/migrate/dead_letter.py" "$MEMORY_DIR/dead_letter.py"
+  fi
+  onhost "$DOCKER cp '$MEMORY_DIR/dead_letter.py' $MCP_SVC:/tmp/dead_letter.py"
+  onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/dead_letter.py $*"
+}
+
+# ── wipe: reset namespaces to empty AND clear the durable-queue state, together ──────────────
+# The trap this closes: wiping a graph but NOT aimem:processed makes re-ingest a no-op (every
+# record is "already processed") -> the graph silently stays empty. Always do both.
+cmd_wipe() {
+  local groups="" yes=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --groups) groups="${2//,/ }"; shift 2;;
+    --yes)    yes=1; shift;;
+    *) echo "✗ unknown arg: $1"; return 1;;
+  esac; done
+  groups_or_die
+  local targets="${groups:-$MEMORY_GROUPS}"
+  echo "▸ wipe — namespaces: $targets"
+  echo "  wipes those graphs AND aimem:processed/queue/dead (so re-ingest is not a silent no-op)"
+  if [ -z "$yes" ]; then
+    printf "  This WIPES the graphs above + the durable-queue state. Type 'wipe' to proceed: "
+    local ans; read -r ans; [ "$ans" = wipe ] || { echo "  aborted."; return 1; }
+  fi
+  echo "  [1/3] backup"; "$SCRIPT_DIR/backup.sh" >/dev/null && echo "    backup ok"
+  echo "  [2/3] wipe graphs"; for g in $targets; do redis_query "$g" "MATCH (n) DETACH DELETE n" >/dev/null; echo "    wiped $g"; done
+  echo "  [3/3] clear durable-queue state"
+  redis_cmd "DEL aimem:processed" >/dev/null; redis_cmd "DEL aimem:queue" >/dev/null; redis_cmd "DEL aimem:dead" >/dev/null
+  echo "    cleared aimem:processed / aimem:queue / aimem:dead"
+  echo "✓ wipe complete. Verify with migrate/reconcile.py (all groups empty, backlog/dead 0)."
+}
+
 case "${1:-}" in
-  doctor)  cmd_doctor ;;
-  status)  cmd_status ;;
-  switch)  shift; cmd_switch "$@" ;;
-  reindex) shift; cmd_reindex "$@" ;;
-  ingest)  shift; cmd_ingest "$@" ;;
-  *) echo "memctl.sh — doctor | status | switch <profile> | reindex --to <profile> [--groups a,b] [--dry-run] [--yes] | ingest <chunks.jsonl> [--groups a,b] [--batch N]"; list_profiles ;;
+  doctor)      cmd_doctor ;;
+  status)      cmd_status ;;
+  switch)      shift; cmd_switch "$@" ;;
+  reindex)     shift; cmd_reindex "$@" ;;
+  ingest)      shift; cmd_ingest "$@" ;;
+  dead-letter) shift; cmd_deadletter "$@" ;;
+  wipe)        shift; cmd_wipe "$@" ;;
+  *) echo "memctl.sh — doctor | status | switch <profile> | reindex --to <profile> [...] | ingest <chunks.jsonl> [...] | dead-letter --list|--replay|--purge [...] | wipe [--groups a,b] [--yes]"; list_profiles ;;
 esac

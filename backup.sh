@@ -59,7 +59,8 @@ REMOTE
 )
 
 if [ -n "$MEMORY_HOST" ]; then
-  ssh "$MEMORY_HOST" "bash -s" <<<"$REMOTE_SCRIPT"
+  # shellcheck disable=SC2086 — MEMORY_SSH_OPTS is intentionally word-split into flags
+  ssh ${MEMORY_SSH_OPTS:-} "$MEMORY_HOST" "bash -s" <<<"$REMOTE_SCRIPT"
 else
   bash -c "$REMOTE_SCRIPT"
 fi
