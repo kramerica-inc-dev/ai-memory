@@ -84,6 +84,9 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - OPENAI_BASE_URL=${OPENAI_API_URL:-https://api.openai.com/v1}
       - MODEL_NAME=${MODEL_NAME:-gpt-5.4-mini}   # example default; override via profiles/env
+      # Per-request LLM timeout (seconds). Bounds a hung/slow extraction call so it fails fast
+      # -> retry -> dead-letter, instead of the 600s SDK default that stalls a whole bulk batch.
+      - LLM_REQUEST_TIMEOUT=${LLM_REQUEST_TIMEOUT:-90}
       - EMBEDDER_MODEL=${EMBEDDER_MODEL:-gemini-embedding-001}
       - EMBEDDER_DIMENSIONS=${EMBEDDER_DIMENSIONS:-768}
       # Local embeddings endpoint (infinity) — used only when EMBEDDER_PROVIDER=openai.

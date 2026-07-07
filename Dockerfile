@@ -30,6 +30,12 @@ RUN sed -i '/temperature=self.temperature,/d' \
 COPY patch-anthropic-client.py /tmp/patch-anthropic-client.py
 RUN /app/mcp/.venv/bin/python /tmp/patch-anthropic-client.py
 
+# Bound each Anthropic request (env LLM_REQUEST_TIMEOUT, default 90s): the client is created with
+# no timeout (600s SDK default), so a hung extraction call stalls a whole add_episode_bulk batch.
+# See patch-anthropic-timeout.py.
+COPY patch-anthropic-timeout.py /tmp/patch-anthropic-timeout.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-anthropic-timeout.py
+
 # The MCP factory gives gpt-5 models reasoning='minimal', but some gpt-5 variants reject that
 # (only none/low/medium/high -> 400). Set to 'low' (valid across the family). Harmless for
 # non-gpt-5 models. Adjust or remove for your provider if not applicable.
