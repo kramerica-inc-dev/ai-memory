@@ -23,6 +23,14 @@ echo "== backup $(date '+%Y-%m-%d %H:%M:%S') =="
 # expansion mangles (and `set -u` turns into a hard error). Grep the one key we need.
 FALKORDB_PASSWORD=$(grep -E '^FALKORDB_PASSWORD=' "$DIR/.env" | tail -1 | cut -d= -f2-)
 
+# Skip while a bulk_ingest run holds the writer lock: forcing a BGSAVE then collides with
+# peak copy-on-write on a growing graph. AOF everysec + savepoints still protect the data;
+# the next scheduled run makes a fresh snapshot once the bulk run releases the lock.
+LOCK=$("$D" exec "$FALKOR" redis-cli -a "$FALKORDB_PASSWORD" --no-auth-warning GET aimem:writer-lock 2>/dev/null || true)
+case "$LOCK" in
+  bulk:*) echo "skip — bulk ingest holds writer-lock ($LOCK); AOF + savepoints cover durability"; exit 0 ;;
+esac
+
 # 1) force a snapshot and wait until it completes (LASTSAVE changes) — a fixed
 #    sleep would silently copy the PREVIOUS dump when a save is slow.
 LAST=$("$D" exec "$FALKOR" redis-cli -a "$FALKORDB_PASSWORD" --no-auth-warning LASTSAVE)

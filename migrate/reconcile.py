@@ -182,6 +182,25 @@ def main(argv) -> int:
         except Exception:  # noqa: BLE001
             pass
 
+    # persistence health — with stop-writes-on-bgsave-error=no a failed save no longer blocks
+    # writes (nor warns), so a failing BGSAVE/AOF would otherwise be invisible. Surface it here.
+    pvals = {}
+    for line in _redis("INFO persistence").splitlines():
+        if ":" in line and not line.startswith("#"):
+            k, _, v = line.partition(":")
+            pvals[k.strip()] = v.strip()
+    rdb_status, aof_status = pvals.get("rdb_last_bgsave_status", ""), pvals.get("aof_last_write_status", "")
+    if rdb_status or aof_status:
+        print(f"  persistence: rdb_last_bgsave={rdb_status or '?'}  "
+              f"aof_last_write={aof_status or '?'}  aof_enabled={pvals.get('aof_enabled', '?')}")
+    if rdb_status and rdb_status != "ok":
+        print(f"  ✗ PERSISTENCE: last BGSAVE status '{rdb_status}' (not ok) — check disk/memory "
+              f"(stop-writes is off, so this no longer blocks writes)")
+        critical += 1
+    if aof_status and aof_status != "ok":
+        print(f"  ✗ PERSISTENCE: AOF last-write status '{aof_status}' (not ok) — durability at risk")
+        critical += 1
+
     if dead:
         print(f"  ✗ DEAD-LETTER: {dead} episode(s) parked in {DEAD_STREAM} — not lost, but "
               f"inert until replayed (inspect: XRANGE {DEAD_STREAM} - +)")
