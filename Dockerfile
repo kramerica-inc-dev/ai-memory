@@ -34,3 +34,16 @@ RUN /app/mcp/.venv/bin/python /tmp/patch-anthropic-client.py
 # (only none/low/medium/high -> 400). Set to 'low' (valid across the family). Harmless for
 # non-gpt-5 models. Adjust or remove for your provider if not applicable.
 RUN sed -i "s/reasoning='minimal'/reasoning='low'/" /app/mcp/src/services/factories.py
+
+# CRITICAL — graphiti-core 0.28.2 mutates the shared driver per group_id (graphiti.py:889);
+# concurrent group workers write into each other's graph (cross-group corruption: episodes
+# land in the wrong graph carrying the right group_id property). Patch: a global episode
+# lock in the queue service serializes processing across groups. See patch-queue-lock.py.
+COPY patch-queue-lock.py /tmp/patch-queue-lock.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-queue-lock.py
+
+# EdgeDuplicate's required fields drop an entire episode when one structured-output call
+# comes back malformed (~25% observed during a bulk re-ingest on the Anthropic path).
+# Patch: safe list defaults. See patch-dedupe-defaults.py.
+COPY patch-dedupe-defaults.py /tmp/patch-dedupe-defaults.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-dedupe-defaults.py
