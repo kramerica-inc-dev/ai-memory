@@ -20,6 +20,7 @@
 #   ./memctl.sh status
 #   ./memctl.sh switch <profile>
 #   ./memctl.sh reindex --to <profile> [--groups a,b,c] [--dry-run] [--yes]
+#   ./memctl.sh ingest <chunks.jsonl> [--groups a,b] [--batch N]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,9 +38,11 @@ MEMORY_GROUPS="${MEMORY_GROUPS:-}"
 PROFILES_DIR="$SCRIPT_DIR/profiles"
 
 # ── execution: run a shell snippet on the target (remote over SSH, or locally) ───────────────
+# MEMORY_SSH_OPTS: extra ssh/scp options (e.g. a specific -i key, or bypassing an ssh agent).
 onhost() {
   if [ -n "$MEMORY_HOST" ]; then
-    ssh -o ConnectTimeout=15 -o LogLevel=ERROR "$MEMORY_HOST" "$1"
+    # shellcheck disable=SC2086 — MEMORY_SSH_OPTS is intentionally word-split into flags
+    ssh ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$MEMORY_HOST" "$1"
   else
     bash -c "$1"
   fi
@@ -135,8 +138,9 @@ deploy_and_up() {
     # config.yaml (env-driven provider:) + docker-compose.yml (the LLM_PROVIDER/EMBEDDER_PROVIDER
     # environment lines) + profiles/ must all be present on the target for the switch to land.
     # tar-over-ssh (not rsync) so it reuses the exact ssh path that already authenticates.
+    # shellcheck disable=SC2086 — MEMORY_SSH_OPTS is intentionally word-split into flags
     tar -C "$SCRIPT_DIR" -czf - config.yaml docker-compose.yml profiles \
-      | ssh -o ConnectTimeout=15 -o LogLevel=ERROR "$MEMORY_HOST" "tar -xzf - -C '$MEMORY_DIR'"
+      | ssh ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$MEMORY_HOST" "tar -xzf - -C '$MEMORY_DIR'"
   fi
   onhost "cd '$MEMORY_DIR' && cat .env 'profiles/$profile.env' > .env.active && echo '$profile' > .active-profile && $COMPOSE --env-file .env.active up -d $MCP_COMPOSE_SVC"
 }
@@ -204,10 +208,41 @@ cmd_reindex() {
   echo "✓ reindex complete. Run ./memctl.sh doctor && ./memctl.sh status."
 }
 
+# ── ingest: supervised mass-ingest launcher (attached; bulk_ingest holds the writer lock) ────
+# The ONLY sanctioned way to run bulk_ingest. Runs ATTACHED (never `docker exec -d`): a detached
+# exec gets reaped and a stall is indistinguishable from progress — exactly what caused the
+# duplicate-writer incident. bulk_ingest.py enforces single-writer (Redis aimem:writer-lock),
+# idempotency (aimem:processed) and dead-letter (aimem:dead) itself; this just ships the files
+# in and streams the run.
+cmd_ingest() {
+  local jsonl="" groups="" batch="25"
+  while [ $# -gt 0 ]; do case "$1" in
+    --groups) groups="$2"; shift 2;;
+    --batch)  batch="$2"; shift 2;;
+    *)        jsonl="$1"; shift;;
+  esac; done
+  [ -n "$jsonl" ] && [ -f "$jsonl" ] || { echo "✗ usage: memctl ingest <chunks.jsonl> [--groups a,b] [--batch N]"; return 1; }
+  local base; base="$(basename "$jsonl")"
+  echo "▸ ingest — $jsonl  (groups=${groups:-all}, batch=$batch, attached/single-writer)"
+  if [ -n "$MEMORY_HOST" ]; then
+    # shellcheck disable=SC2086
+    scp -O ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$jsonl" "$MEMORY_HOST:$MEMORY_DIR/$base"
+    # shellcheck disable=SC2086
+    scp -O ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$SCRIPT_DIR/migrate/bulk_ingest.py" "$MEMORY_HOST:$MEMORY_DIR/bulk_ingest.py"
+  else
+    cp "$jsonl" "$MEMORY_DIR/$base"; cp "$SCRIPT_DIR/migrate/bulk_ingest.py" "$MEMORY_DIR/bulk_ingest.py"
+  fi
+  onhost "$DOCKER cp '$MEMORY_DIR/$base' $MCP_SVC:/tmp/$base && $DOCKER cp '$MEMORY_DIR/bulk_ingest.py' $MCP_SVC:/tmp/bulk_ingest.py"
+  local args="/tmp/$base --batch $batch"
+  [ -n "$groups" ] && args="$args --groups $groups"
+  onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/bulk_ingest.py $args"
+}
+
 case "${1:-}" in
   doctor)  cmd_doctor ;;
   status)  cmd_status ;;
   switch)  shift; cmd_switch "$@" ;;
   reindex) shift; cmd_reindex "$@" ;;
-  *) echo "memctl.sh — doctor | status | switch <profile> | reindex --to <profile> [--groups a,b] [--dry-run] [--yes]"; list_profiles ;;
+  ingest)  shift; cmd_ingest "$@" ;;
+  *) echo "memctl.sh — doctor | status | switch <profile> | reindex --to <profile> [--groups a,b] [--dry-run] [--yes] | ingest <chunks.jsonl> [--groups a,b] [--batch N]"; list_profiles ;;
 esac

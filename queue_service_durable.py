@@ -21,7 +21,14 @@ This replacement keeps the exact public interface of the original QueueService b
   - enforces the hygiene gate on the MCP write path when SANITIZER_URL is set:
     episode content is scrubbed (secrets/PII) at consume time, BEFORE it reaches the
     extraction LLM or the graph. Fail-closed: a sanitizer failure is a transient
-    error (backoff → dead-letter), never an unscrubbed pass-through.
+    error (backoff → dead-letter), never an unscrubbed pass-through;
+  - publishes a heartbeat (`aimem:heartbeat:consumer`) so a stalled consumer is
+    observable (reconcile shows its age + processed count) instead of looking identical
+    to a slow-but-healthy one;
+  - cooperates with the mass-ingest tool via a cross-process writer lock
+    (`aimem:writer-lock`): when a bulk_ingest run holds it, this consumer PAUSES (it
+    stops reading/writing) so the two never write the same graph concurrently — the
+    corruption class that a single in-process consumer alone cannot prevent.
 
 Installed by the Dockerfile as /app/mcp/src/services/queue_service.py. The companion
 patch-durable-queue.py passes entity_types to initialize() at the server call site.
@@ -48,6 +55,8 @@ logger = logging.getLogger(__name__)
 STREAM = 'aimem:queue'
 DEAD = 'aimem:dead'
 PROCESSED = 'aimem:processed'
+HEARTBEAT = 'aimem:heartbeat:consumer'   # {state, ts, count, name}, refreshed each step
+WRITER_LOCK = 'aimem:writer-lock'        # held by bulk_ingest during a mass run
 GROUP = 'workers'
 CONSUMER = 'main'
 MAX_ATTEMPTS = int(os.environ.get('QUEUE_MAX_ATTEMPTS', '5'))
@@ -72,6 +81,7 @@ class QueueService:
         self._consumer_task: asyncio.Task | None = None
         # Serializes episode execution; also honored by the add_episode_task shim.
         self._exec_lock = asyncio.Lock()
+        self._count = 0   # episodes processed since start (for the heartbeat)
 
     # ── wiring ───────────────────────────────────────────────────────────────
 
@@ -161,6 +171,30 @@ class QueueService:
         except Exception as e:  # noqa: BLE001 — any failure must stay fail-closed
             raise RuntimeError(f'sanitizer failed ({type(e).__name__}): {e}') from e
 
+    # ── observability + cross-process cooperation ────────────────────────────
+
+    async def _heartbeat(self, state: str, name: str = '') -> None:
+        """Publish liveness so a stall is visible. `state` is processing|idle|paused."""
+        if self._redis is None:
+            return
+        try:
+            await self._redis.set(HEARTBEAT, json.dumps({
+                'state': state, 'ts': datetime.now(timezone.utc).isoformat(),
+                'count': self._count, 'name': name[:80],
+            }))
+        except Exception:  # noqa: BLE001 — heartbeat must never break the consumer
+            pass
+
+    async def _bulk_holds_lock(self) -> bool:
+        """True while a bulk_ingest run holds the writer lock — we then pause writing."""
+        if self._redis is None:
+            return False
+        try:
+            owner = await self._redis.get(WRITER_LOCK)
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(owner) and str(owner).startswith('bulk:')
+
     # ── consumer ─────────────────────────────────────────────────────────────
 
     async def _consume(self) -> None:
@@ -169,6 +203,12 @@ class QueueService:
         cursor = '0'          # '0' = this consumer's pending (pre-crash) entries first
         while True:
             try:
+                # Yield the graph entirely while a mass-ingest run holds the writer lock:
+                # do not even read an entry (an unacked read would stall a pending entry).
+                if await self._bulk_holds_lock():
+                    await self._heartbeat('paused')
+                    await asyncio.sleep(5)
+                    continue
                 resp = await self._redis.xreadgroup(
                     GROUP, CONSUMER, {STREAM: cursor}, count=1,
                     block=5000 if cursor == '>' else None)
@@ -176,6 +216,8 @@ class QueueService:
                     if cursor != '>':
                         cursor = '>'  # pending backlog drained -> switch to live entries
                         logger.info('Crash-recovery backlog drained; consuming live entries')
+                    else:
+                        await self._heartbeat('idle')
                     continue
                 entry_id, fields = resp[0][1][0]
                 if cursor != '>':
@@ -202,6 +244,9 @@ class QueueService:
         try:
             logger.info(f'Processing episode {f.get("name", "?")[:60]!r} for group {group_id} '
                         f'(attempt {attempt + 1})')
+            # Heartbeat BEFORE the (up to minutes-long) add_episode, so a slow episode
+            # is distinguishable from a hang: readers see state=processing + a fresh ts.
+            await self._heartbeat('processing', f.get('name', ''))
             content = await self._sanitize(f.get('content', ''))
             async with self._exec_lock:
                 await self._graphiti_client.add_episode(
@@ -217,6 +262,7 @@ class QueueService:
             if key:
                 await self._redis.sadd(PROCESSED, key)
             await self._ack(entry_id)
+            self._count += 1
             logger.info(f'Successfully processed episode for group {group_id}')
         except Exception as e:  # noqa: BLE001
             msg = str(e)

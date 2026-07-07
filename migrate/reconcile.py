@@ -48,10 +48,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -67,7 +69,10 @@ MCP_SVC = os.environ.get("MCP_SVC", "ai-memory-graphiti-mcp-1")
 SPACE_KEY = "aimem:embedding_space"
 QUEUE_STREAM = "aimem:queue"
 DEAD_STREAM = "aimem:dead"
+WRITER_LOCK = "aimem:writer-lock"
+HEARTBEAT = "aimem:heartbeat:consumer"
 BACKLOG_WARN = int(os.environ.get("QUEUE_BACKLOG_WARN", "50"))
+STALL_WARN = int(os.environ.get("CONSUMER_STALL_WARN", "600"))  # s; > worst-case episode
 
 
 def _onhost(cmd: str, timeout: int = 40) -> str:
@@ -121,6 +126,18 @@ def main(argv) -> int:
         print("✗ CRITICAL: FalkorDB unreachable (no PONG) — nothing can be verified")
         return 2
 
+    # An active ingest (writer lock held, or a nonzero backlog) means entities can exist
+    # mid-extraction WITHOUT their MENTIONS edge yet — they look like orphans but aren't.
+    # Suppress --fix then, so a scheduled reconcile never deletes in-flight work.
+    writer = _redis(f"GET {WRITER_LOCK}").strip()
+    q0 = _redis(f"XLEN {QUEUE_STREAM}").strip()
+    backlog0 = int(q0) if q0.isdigit() else 0
+    drain_active = bool(writer) or backlog0 > 0
+    fix = a.fix and not drain_active
+    if a.fix and not fix:
+        print(f"  · --fix SUPPRESSED: ingest active (writer-lock={writer or '-'}, "
+              f"backlog={backlog0}) — orphan sweep would delete mid-extraction entities")
+
     print("▸ reconcile — invariants per namespace")
     for g in groups:
         foreign = _graph_count(
@@ -135,7 +152,7 @@ def main(argv) -> int:
             critical += 1
         if orphans:
             findings += 1
-            if a.fix:
+            if fix:
                 _redis(f'GRAPH.QUERY {g} "MATCH (n:Entity) WHERE NOT (n)<-[:MENTIONS]-() DETACH DELETE n"')
                 line += f"   → swept {orphans} orphans"
         if pending:
@@ -149,6 +166,22 @@ def main(argv) -> int:
     queued = int(queue_raw) if queue_raw.isdigit() else None
     print(f"  queue: backlog={queued if queued is not None else '?'}  "
           f"dead-letter={dead if dead is not None else '?'}")
+
+    # consumer heartbeat — a stall is a stale ts, distinct from a legitimately slow episode
+    hb_raw = _redis(f"GET {HEARTBEAT}").strip()
+    if hb_raw:
+        try:
+            hb = json.loads(hb_raw)
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(hb["ts"])).total_seconds()
+            print(f"  consumer: state={hb.get('state','?')} processed={hb.get('count','?')} "
+                  f"heartbeat_age={int(age)}s")
+            if hb.get("state") == "processing" and age > STALL_WARN:
+                print(f"  ✗ STALL: consumer stuck 'processing' for {int(age)}s (> {STALL_WARN}s) "
+                      f"— check the graphiti-mcp logs")
+                findings += 1
+        except Exception:  # noqa: BLE001
+            pass
+
     if dead:
         print(f"  ✗ DEAD-LETTER: {dead} episode(s) parked in {DEAD_STREAM} — not lost, but "
               f"inert until replayed (inspect: XRANGE {DEAD_STREAM} - +)")
@@ -173,7 +206,7 @@ def main(argv) -> int:
         print(f"→ CRITICAL: {critical} invariant(s) broken — stop bulk writes, investigate first")
         return 2
     if findings:
-        print(f"→ {findings} finding(s){' (fixed where safe)' if a.fix else ' — rerun with --fix to sweep orphans'}")
+        print(f"→ {findings} finding(s){' (fixed where safe)' if fix else ' — rerun with --fix to sweep orphans'}")
         return 1
     print("✓ all invariants hold")
     return 0

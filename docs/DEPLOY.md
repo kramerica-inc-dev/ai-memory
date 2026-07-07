@@ -164,7 +164,24 @@ Completions endpoint does not speak (404) — verify, or route via an OpenAI-com
   or an SSH agent being unlocked at 03:00.
 - `./reconcile-cron.sh` wraps `migrate/reconcile.py --fix` the same way: schedule it daily to get
   self-heal plus alerting on invariant violations, dead-lettered episodes, and queue backlog
-  (nonzero exit → let your scheduler mail you the run details).
+  (nonzero exit → let your scheduler mail you the run details). It suppresses the orphan sweep
+  while an ingest is active (writer lock held or backlog > 0), so a scheduled run never deletes
+  mid-extraction entities.
+
+## Mass ingest / onboarding
+
+Large imports run through **`./memctl.sh ingest <chunks.jsonl> [--groups a,b] [--batch N]`** —
+the only sanctioned launcher for `migrate/bulk_ingest.py`. It runs the tool **attached** (never
+detached), and the tool enforces the same guarantees as the daily MCP path:
+- **Single writer** via a Redis lock `aimem:writer-lock` (a second run refuses; the durable-queue
+  consumer pauses while it is held, so the two never write the same graph concurrently);
+- **Idempotent** via `aimem:processed` (the same key the queue uses) — re-runs/overlaps are no-ops;
+- **No silent loss** — a batch that fails after retries is written to `aimem:dead`, not dropped;
+- **Observable** — `aimem:heartbeat:bulk`, and the consumer heartbeat `aimem:heartbeat:consumer`
+  that `reconcile` reports (a stale `processing` heartbeat past `CONSUMER_STALL_WARN` is a stall).
+
+**Always clear `aimem:processed` together with a graph wipe** (`memctl reindex` does; a manual
+`GRAPH.DELETE` does not) — otherwise re-ingest is a no-op and the graph stays empty.
 - Forgetting: Graphiti supersedes facts automatically; manual removal via `delete_episode`,
   `delete_entity_edge`, or wiping a whole group (`clear_graph` / FalkorDB `GRAPH.DELETE <group>`).
   After a `GRAPH.DELETE`, re-populate the group (a write rebuilds its search index).
