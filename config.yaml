@@ -21,7 +21,11 @@ llm:
   # profiles/*.env or env (see "Choosing your models" in docs/DEPLOY.md). A small/fast model is
   # fine here; extraction needs no deep reasoning.
   model: ${MODEL_NAME:gpt-5.4-mini}
-  max_tokens: 4096
+  # Extraction output ceiling. Too low TRUNCATES structured output on entity-dense chunks
+  # (the model stops mid-JSON at max_tokens -> "Invalid JSON: EOF" -> the episode is dropped
+  # after retries). Keep it generous; extraction cost only rises when output is actually large.
+  # A truncated episode is never fabricated/repaired — it fails and is dead-lettered (visible).
+  max_tokens: 8192
   temperature: null       # some reasoning models reject temperature -> leave it out
   providers:
     openai:

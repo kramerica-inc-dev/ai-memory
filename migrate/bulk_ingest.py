@@ -55,6 +55,24 @@ LOCK_TTL = 600            # seconds; refreshed at half-life, so a crash frees it
 MAX_BATCH_ATTEMPTS = 3    # transient failures get retried before dead-lettering
 TRANSIENT = ("rate limit", "429", "timeout", "timed out", "connection",
              "overloaded", "503", "529", "temporarily")
+# Deterministic failure categories for the dead-letter (mirrors queue_service_durable).
+_FAILURE_MARKERS = (
+    ("truncation", ("eof while parsing", "unterminated", "max_tokens", "truncat", "unexpected end")),
+    ("sanitizer", ("sanitizer",)),
+    ("rate_limit", ("rate limit", "429", "overloaded", "529", "quota", "temporarily")),
+    ("timeout", ("timeout", "timed out")),
+    ("connection", ("connection", "econnrefused", "connect")),
+    ("refusal", ("refusalerror", "content policy", "blocked by")),
+    ("validation", ("validation error", "field required", "pydantic", "value_error")),
+)
+
+
+def _classify_failure(msg: str) -> str:
+    m = (msg or "").lower()
+    for tag, needles in _FAILURE_MARKERS:
+        if any(n in m for n in needles):
+            return tag
+    return "other"
 
 
 def _idem_key(group_id: str, name: str, source_description: str, content: str) -> str:
@@ -164,12 +182,14 @@ async def ingest_batch(g, r, grp, batch, custom, now):
                 await asyncio.sleep(min(30 * attempt, 120))
                 continue
             # Give up -> quarantine every record in this batch (never a silent drop).
+            reason = _classify_failure(msg)
             for rec in fresh:
                 await r.xadd(DEAD, {"group": grp, "name": rec["name"],
                                     "content": rec["content"],
                                     "source_description": rec.get("source_description", ""),
-                                    "key": _rec_key(rec), "error": msg[:400],
+                                    "key": _rec_key(rec), "error": msg[:400], "reason": reason,
                                     "failed_at": datetime.now(timezone.utc).isoformat()})
+            print(f"  [{grp}] dead-lettered {len(fresh)} record(s) (reason={reason})")
             return 0, 0, 0, len(fresh)
 
 

@@ -71,6 +71,28 @@ def _idempotency_key(group_id: str, name: str, source_description: str, content:
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:32]
 
 
+# Deterministic, provider-agnostic failure categories for the dead-letter — so a quarantined
+# episode is self-documenting (truncation vs refusal vs rate-limit vs …) instead of a mystery.
+# Order matters: more specific categories first. Match on any provider's error string.
+_FAILURE_MARKERS = (
+    ('truncation', ('eof while parsing', 'unterminated', 'max_tokens', 'truncat', 'unexpected end')),
+    ('sanitizer', ('sanitizer',)),
+    ('rate_limit', ('rate limit', '429', 'overloaded', '529', 'quota', 'temporarily')),
+    ('timeout', ('timeout', 'timed out')),
+    ('connection', ('connection', 'econnrefused', 'connect')),
+    ('refusal', ('refusalerror', 'content policy', 'blocked by')),
+    ('validation', ('validation error', 'field required', 'pydantic', 'value_error')),
+)
+
+
+def _classify_failure(msg: str) -> str:
+    m = (msg or '').lower()
+    for tag, needles in _FAILURE_MARKERS:
+        if any(n in m for n in needles):
+            return tag
+    return 'other'
+
+
 class QueueService:
     """Durable, idempotent, strictly-serialized episode queue (Redis Streams)."""
 
@@ -270,10 +292,12 @@ class QueueService:
             logger.error(f'Failed to process episode for group_id {group_id} '
                          f'(attempt {attempt + 1}, transient={transient}): {msg[:200]}')
             if attempt + 1 >= MAX_ATTEMPTS:
-                await self._redis.xadd(DEAD, {**f, 'error': msg[:500],
+                reason = _classify_failure(msg)
+                await self._redis.xadd(DEAD, {**f, 'error': msg[:500], 'reason': reason,
                                               'failed_at': datetime.now(timezone.utc).isoformat()})
                 await self._ack(entry_id)
-                logger.error(f'Episode moved to dead-letter stream {DEAD} after {attempt + 1} attempts')
+                logger.error(f'Episode moved to dead-letter stream {DEAD} '
+                             f'after {attempt + 1} attempts (reason={reason})')
                 return
             # Requeue with attempt+1, then back off — long enough to ride out rate limits.
             await self._redis.xadd(STREAM, {**f, 'attempt': str(attempt + 1)})
