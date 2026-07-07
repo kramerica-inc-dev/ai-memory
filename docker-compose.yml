@@ -18,7 +18,14 @@ services:
     restart: unless-stopped
     environment:
       # FalkorDB enforces the password via standard redis (the image does not honor FALKORDB_PASSWORD itself)
-      - REDIS_ARGS=--requirepass ${FALKORDB_PASSWORD}
+      # Durability: explicit RDB savepoints + AOF everysec — a crash costs at most ~1s of
+      # writes instead of everything since the last BGSAVE. The AOF (appendonlydir/) lives
+      # next to dump.rdb in the data bind-mount, so file-level backups cover both.
+      # ⚠ UPGRADING from an RDB-only deployment: booting a container with --appendonly yes
+      # on a data dir that has ONLY dump.rdb makes Redis IGNORE the RDB and start EMPTY.
+      # Safe order: boot without appendonly → runtime `CONFIG SET appendonly yes` → wait for
+      # the rewrite → only then recreate with this flag. See docs/DEPLOY.md (Durability).
+      - REDIS_ARGS=--requirepass ${FALKORDB_PASSWORD} --save 900 1 --save 300 10 --appendonly yes --appendfsync everysec
       - BROWSER=${BROWSER:-0}          # Browser UI off by default (0). Set to 1 for debug.
       # Module load args. The image default sets the DEPRECATED `TIMEOUT 1000` = a hard 1s limit on
       # READ queries -> graphiti's dedup fulltext queries (~1s, growing with the graph) fail with
@@ -82,6 +89,16 @@ services:
       # Local embeddings endpoint (infinity) — used only when EMBEDDER_PROVIDER=openai.
       - EMBEDDER_OPENAI_URL=${EMBEDDER_OPENAI_URL:-http://infinity:7997}
       - EMBEDDER_OPENAI_KEY=${EMBEDDER_OPENAI_KEY:-local}
+      # Local reranker: replaces graphiti-core's unconditional OpenAI default for the
+      # cross-encoder. Empty = keep the OpenAI behavior. The model runs in infinity.
+      - RERANKER_URL=${RERANKER_URL:-http://infinity:7997}
+      - RERANKER_MODEL=${RERANKER_MODEL:-BAAI/bge-reranker-v2-m3}
+      # Hygiene gate on the MCP write path: when set, the durable queue scrubs episode
+      # content via POST $SANITIZER_URL/api/sanitize BEFORE the extraction LLM / graph.
+      # Fail-closed: a sanitizer failure is transient → backoff → dead-letter, never an
+      # unscrubbed pass-through. Empty = gate OFF (content is ingested as-is).
+      - SANITIZER_URL=${SANITIZER_URL:-}
+      - SANITIZER_DEPTH=${SANITIZER_DEPTH:-quick}
       # MUST match the embedder dimension, else vector search breaks after a FalkorDB restart
       - EMBEDDING_DIM=${EMBEDDER_DIMENSIONS:-768}
     volumes:
@@ -99,7 +116,9 @@ services:
     restart: unless-stopped
     # CPU-only hosts: skip the model warmup/timing sweep (hangs on some CPUs) and the deprecated
     # bettertransformer optimization; otherwise the server may fail to bind.
-    command: ["v2", "--model-id", "${INFINITY_MODEL:-BAAI/bge-m3}", "--port", "7997",
+    # Second model = the local reranker (see RERANKER_URL above). One-time download to the cache.
+    command: ["v2", "--model-id", "${INFINITY_MODEL:-BAAI/bge-m3}",
+              "--model-id", "${INFINITY_RERANK_MODEL:-BAAI/bge-reranker-v2-m3}", "--port", "7997",
               "--device", "cpu", "--no-bettertransformer", "--no-model-warmup"]
     environment:
       - HF_HOME=/cache
@@ -116,7 +135,13 @@ services:
     depends_on:
       - graphiti-mcp
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # CADDY_CONFIG=./Caddyfile.auth (in .env) activates the auth variant: bearer token
+      # on :8000 (MCP). Requires MCP_TOKEN in .env and the Authorization header on every
+      # MCP client. Copy Caddyfile.auth.example to Caddyfile.auth to get started.
+      - ${CADDY_CONFIG:-./Caddyfile}:/etc/caddy/Caddyfile:ro
+    environment:
+      - MCP_TOKEN=${MCP_TOKEN:-}
+      - CADDY_PASS_HASH=${CADDY_PASS_HASH:-}
     ports:
       - "${MCP_BIND:-0.0.0.0}:8000:8000"   # MCP/HTTP — reachable on the tailnet
       # Optional: only if you proxy an external sanitizer through this host (see Caddyfile).

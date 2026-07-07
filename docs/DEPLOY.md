@@ -130,10 +130,20 @@ Completions endpoint does not speak (404) — verify, or route via an OpenAI-com
 
 ## FalkorDB operational notes
 
+- **Durability (AOF).** The compose file enables explicit RDB savepoints plus an append-only
+  file (`--appendonly yes --appendfsync everysec`): a crash costs at most ~1s of writes instead
+  of everything since the last `BGSAVE`. The AOF lives in `appendonlydir/` next to `dump.rdb`
+  in the data bind-mount, so file-level backups cover both.
+  **⚠ Upgrading from an RDB-only data dir — and restoring from a `dump.rdb` backup:** booting
+  with `--appendonly yes` on a data dir that has only `dump.rdb` makes Redis **ignore the RDB
+  and start empty**. Safe order: boot once *without* appendonly (RDB loads) → runtime
+  `CONFIG SET appendonly yes` → wait until `aof_rewrite_in_progress:0` → then recreate with the
+  flag. Verify with `INFO persistence` (`aof_enabled:1`).
 - **Query timeout.** The image default `TIMEOUT 1000` is a hard 1s limit on read queries;
   Graphiti's dedup fulltext queries grow with the graph and start timing out ("Query timed out",
-  episodes silently not landing). The compose file replaces it with
-  `TIMEOUT_DEFAULT 60000 TIMEOUT_MAX 120000` (they do not coexist with the deprecated `TIMEOUT`).
+  episodes silently not landing). The compose file replaces it with the newer mechanism and
+  generous limits (`TIMEOUT_DEFAULT 300000 TIMEOUT_MAX 600000` — they do not coexist with the
+  deprecated `TIMEOUT`): on a large group a single `add_episode` dedup can take minutes.
   To apply live without a restart: `GRAPH.CONFIG SET TIMEOUT 0` + `TIMEOUT_MAX`/`TIMEOUT_DEFAULT`
   via `redis-cli`.
 - **Post-reboot search.** After a reboot semantic search on a group can return 0 until the first
@@ -149,6 +159,12 @@ Completions endpoint does not speak (404) — verify, or route via an OpenAI-com
 - `./backup.sh` forces a `BGSAVE` and keeps the last `KEEP` timestamped copies under
   `MEMORY_DIR/backups/` (works locally or over SSH via `MEMORY_HOST`). Wire it into cron if you want
   a nightly snapshot.
+- `./backup-local.sh` is the **server-side** variant for a scheduler on the docker host itself
+  (e.g. Synology DSM Task Scheduler): no SSH, so it does not depend on a workstation being awake
+  or an SSH agent being unlocked at 03:00.
+- `./reconcile-cron.sh` wraps `migrate/reconcile.py --fix` the same way: schedule it daily to get
+  self-heal plus alerting on invariant violations, dead-lettered episodes, and queue backlog
+  (nonzero exit → let your scheduler mail you the run details).
 - Forgetting: Graphiti supersedes facts automatically; manual removal via `delete_episode`,
   `delete_entity_edge`, or wiping a whole group (`clear_graph` / FalkorDB `GRAPH.DELETE <group>`).
   After a `GRAPH.DELETE`, re-populate the group (a write rebuilds its search index).
@@ -159,6 +175,12 @@ Every ingest path (`backfill.py`, `index_files.py`, and any capture hook) sends 
 secret-sanitizer **before** it reaches the extraction LLM or the graph, so credentials and PII
 never leak into memory. It is **fail-closed**: if the sanitizer is unreachable, nothing is
 ingested (unless you explicitly pass `--no-sanitize`, which is only for throwaway tests).
+
+The gate also covers the **MCP write path** (`add_memory` from any client): when `SANITIZER_URL`
+is set on the `graphiti-mcp` service, the durable queue scrubs episode content at consume time,
+before extraction. Fail-closed here too — a sanitizer failure classifies as transient (backoff,
+then dead-letter), never an unscrubbed pass-through. Leave `SANITIZER_URL` empty to disable the
+gate (the queue then logs a warning at startup).
 
 The tool expects a simple HTTP contract: `POST /api/sanitize` with `{"text": ..., "depth": ...}`
 returning `{"sanitized": ...}` (`depth` is `quick` | `standard` | `deep`). A ready-made service
@@ -192,6 +214,9 @@ this repo intentionally ships only the sanitizer integration and leaves the vaul
 
 ## Hardening (beyond the tailnet)
 
-The MCP server has no built-in auth. If you must expose it more widely, put a reverse proxy
-(Caddy/nginx) with bearer-token or OIDC (e.g. Authelia) auth in front, keep image tags pinned, and
-upgrade the "experimental" MCP server deliberately.
+The MCP server has no built-in auth. A ready-made bearer-token layer ships as
+`Caddyfile.auth.example`: copy it to `Caddyfile.auth`, set `CADDY_CONFIG=./Caddyfile.auth` and
+`MCP_TOKEN` in `.env`, recreate the caddy service, and add the
+`Authorization: Bearer <MCP_TOKEN>` header to every MCP client. For anything beyond that, put a
+reverse proxy with OIDC (e.g. Authelia) in front, keep image tags pinned, and upgrade the
+"experimental" MCP server deliberately.

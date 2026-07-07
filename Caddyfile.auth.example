@@ -1,0 +1,38 @@
+# Auth variant of the Caddyfile — defense in depth on top of a private network.
+# Activate: copy to Caddyfile.auth, set CADDY_CONFIG=./Caddyfile.auth in .env, plus
+# MCP_TOKEN (bearer for :8000); then recreate the caddy service.
+#
+#   generate MCP_TOKEN:       openssl rand -hex 32
+#   make CADDY_PASS_HASH:     docker run --rm caddy:2-alpine caddy hash-password -p '<password>'
+#                             (only needed if you add basic_auth blocks, e.g. for a dashboard)
+#
+# ⚠ Writing secrets into .env from a remote shell: heredocs mangle `$` characters in
+#   bcrypt hashes — write values expansion-safely via stdin (printf '%s' "$VAL" | ...).
+#
+# After activation EVERY MCP client must send the header, e.g. Claude Code:
+#   claude mcp add --transport http memory http://<host>:8000/mcp \
+#     --header "Authorization: Bearer <MCP_TOKEN>"
+# Keep the private network as the perimeter; this guards against a confused agent
+# on another device reaching clear_graph/delete_* unauthenticated.
+
+{
+	admin off
+	auto_https off
+}
+
+# MCP — bearer token required.
+:8000 {
+	@unauth not header Authorization "Bearer {env.MCP_TOKEN}"
+	respond @unauth 401
+	reverse_proxy graphiti-mcp:8000 {
+		header_up Host localhost:8000
+		header_up -Origin
+		flush_interval -1
+	}
+}
+
+# Optional sanitizer proxy (unauthenticated pass-through: put your sanitizer behind its
+# own auth if it needs any). Remove this block if you do not proxy a sanitizer here.
+:8080 {
+	reverse_proxy sanitizer.example.internal:3100
+}
