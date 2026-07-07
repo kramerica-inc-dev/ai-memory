@@ -42,6 +42,8 @@ from mapping_config import load_mapping, apply_conf    # noqa: E402
 apply_conf()   # memctl.conf as env defaults (explicit env still wins) — parity with the shell tools
 
 MCP_URL = os.environ.get("MCP_URL", "http://localhost:8000/mcp")
+# Bearer token for an auth-fronted MCP endpoint (Caddyfile.auth) — empty = no header.
+MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
 CLAUDE_MEM_DB = os.environ.get("CLAUDE_MEM_DB", str(Path.home() / ".claude-mem" / "claude-mem.db"))
 # Optional generic "markdown directory" source (e.g. an assistant's MEMORY.md / USER.md notes).
 MARKDOWN_DIR = Path(os.environ.get("MARKDOWN_DIR", str(Path.home() / "notes")))
@@ -60,6 +62,8 @@ class MCPClient:
         data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json",
                    "Accept": "application/json, text/event-stream"}
+        if MCP_TOKEN:
+            headers["Authorization"] = f"Bearer {MCP_TOKEN}"
         if self.sid:
             headers["mcp-session-id"] = self.sid
         req = urllib.request.Request(self.base, data=data, headers=headers, method="POST")
