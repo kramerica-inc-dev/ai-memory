@@ -52,6 +52,19 @@ redis_query() {
   onhost "set -a; . '$MEMORY_DIR/.env'; set +a; $DOCKER exec $FALKOR_SVC redis-cli -a \"\$FALKORDB_PASSWORD\" --no-auth-warning GRAPH.QUERY $g '$q' 2>/dev/null"
 }
 
+# Arbitrary redis command on the FalkorDB container (same auth path as redis_query).
+redis_cmd() {
+  onhost "set -a; . '$MEMORY_DIR/.env'; set +a; $DOCKER exec $FALKOR_SVC redis-cli -a \"\$FALKORDB_PASSWORD\" --no-auth-warning $1 2>/dev/null"
+}
+
+# ── embedding-space marker: records which vector space the stored graphs were built in ──────
+# Written on every switch/reindex; doctor (and migrate/reconcile.py) alarm on drift between
+# this marker and the live embedder env. Catches the "bare docker compose up -d regressed the
+# embedder → vector dimension mismatch" class of incident before it corrupts search.
+SPACE_KEY="aimem:embedding_space"
+set_space_marker() { redis_cmd "SET $SPACE_KEY $1" >/dev/null; }
+get_space_marker() { redis_cmd "GET $SPACE_KEY" | tr -d '\r'; }
+
 mcp_env() { onhost "$DOCKER exec $MCP_SVC printenv" 2>/dev/null; }
 active_profile() { onhost "cat '$MEMORY_DIR/.active-profile' 2>/dev/null" || true; }
 profile_val() { grep -E "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
@@ -75,6 +88,15 @@ cmd_doctor() {
     echo "  ✗ DIM MISMATCH: EMBEDDER_DIMENSIONS=$edim vs EMBEDDING_DIM=$edim2 → vector-search breaks after restart"; bad=1
   else
     echo "  ✓ dims consistent (EMBEDDER_DIMENSIONS == EMBEDDING_DIM == ${edim:-?})"
+  fi
+  local marker want; marker="$(get_space_marker)"; want="$emodel/$edim"
+  if [ -z "$marker" ]; then
+    echo "  · embedding-space marker not set — run switch (or reindex) once to record it"
+  elif [ "$marker" != "$want" ]; then
+    echo "  ✗ EMBEDDING-SPACE DRIFT: graphs were built in '$marker' but live embedder is '$want'"
+    echo "    → stored vectors are invalid for this embedder. Fix the env/profile (switch) or reindex."; bad=1
+  else
+    echo "  ✓ embedding space matches stored graphs ($marker)"
   fi
   key_present() { grep -qE "^$1=.+" <<<"$env"; }
   case "$obase" in
@@ -135,6 +157,7 @@ cmd_switch() {
   fi
   echo "▸ switch → $profile (LLM-only; embedder unchanged, vectors stay valid)"
   deploy_and_up "$profile"
+  set_space_marker "${tem:-$lem}/${ted:-$led}"
   echo "✓ switched to '$profile'. Verify with:  ./memctl.sh doctor"
 }
 
@@ -164,6 +187,7 @@ cmd_reindex() {
   echo "  [1/6] backup"; "$SCRIPT_DIR/backup.sh"
   echo "  [2/6] wipe graphs"; for g in $groups; do redis_query "$g" "MATCH (n) DETACH DELETE n" >/dev/null; echo "    wiped $g"; done
   echo "  [3/6] switch env + restart ($profile)"; deploy_and_up "$profile"
+  set_space_marker "$(profile_val "$pf" EMBEDDER_MODEL)/$(profile_val "$pf" EMBEDDER_DIMENSIONS)"
   echo "  [4/6] reset ledgers"; rm -f "$SCRIPT_DIR/migrate/.indexed.json" "$SCRIPT_DIR/migrate/.backfilled.txt" "$SCRIPT_DIR/migrate/.indexed.lock"
   echo "  [5/6] backfill + index (this is the slow part)"
   ( cd "$SCRIPT_DIR" && python3 migrate/backfill.py --source all && python3 migrate/index_files.py --all --docs-only )
