@@ -35,15 +35,25 @@ RUN /app/mcp/.venv/bin/python /tmp/patch-anthropic-client.py
 # non-gpt-5 models. Adjust or remove for your provider if not applicable.
 RUN sed -i "s/reasoning='minimal'/reasoning='low'/" /app/mcp/src/services/factories.py
 
-# CRITICAL — graphiti-core 0.28.2 mutates the shared driver per group_id (graphiti.py:889);
-# concurrent group workers write into each other's graph (cross-group corruption: episodes
-# land in the wrong graph carrying the right group_id property). Patch: a global episode
-# lock in the queue service serializes processing across groups. See patch-queue-lock.py.
-COPY patch-queue-lock.py /tmp/patch-queue-lock.py
-RUN /app/mcp/.venv/bin/python /tmp/patch-queue-lock.py
+# DURABLE QUEUE (replaces the stock in-memory queue service) — fixes three incident
+# classes at once: restart-drops (Redis Streams, AOF-durable), rate-limit drops (real
+# backoff + dead-letter stream), and cross-group graph corruption from graphiti-core
+# 0.28.2's shared-driver mutation (single strictly-serialized consumer). See
+# queue_service_durable.py. For a minimal alternative without the durable queue,
+# patch-queue-lock.py (in this repo) provides just the corruption fix.
+COPY queue_service_durable.py /app/mcp/src/services/queue_service.py
+COPY patch-durable-queue.py /tmp/patch-durable-queue.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-durable-queue.py
 
 # EdgeDuplicate's required fields drop an entire episode when one structured-output call
 # comes back malformed (~25% observed during a bulk re-ingest on the Anthropic path).
 # Patch: safe list defaults. See patch-dedupe-defaults.py.
 COPY patch-dedupe-defaults.py /tmp/patch-dedupe-defaults.py
 RUN /app/mcp/.venv/bin/python /tmp/patch-dedupe-defaults.py
+
+# Optional LOCAL reranker via the infinity container's /rerank endpoint — removes the
+# unconditional OpenAI dependency of graphiti-core's default cross-encoder. Opt-in:
+# active only when RERANKER_URL is set (see docker-compose.yml + patch-reranker.py).
+COPY infinity_reranker_client.py /app/mcp/src/infinity_reranker_client.py
+COPY patch-reranker.py /tmp/patch-reranker.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-reranker.py

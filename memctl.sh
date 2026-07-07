@@ -99,9 +99,15 @@ cmd_doctor() {
     echo "  ✓ embedding space matches stored graphs ($marker)"
   fi
   key_present() { grep -qE "^$1=.+" <<<"$env"; }
+  local rurl; rurl=$(envval RERANKER_URL "$env")
+  [ -n "$rurl" ] && echo "  ✓ reranker: local via $rurl ($(envval RERANKER_MODEL "$env"))"
   case "$obase" in
-    *api.openai.com*|"") key_present OPENAI_API_KEY && echo "  ✓ OPENAI_API_KEY present (reranker + openai extraction)" || { echo "  ✗ OPENAI_API_KEY missing — reranker needs it"; bad=1; } ;;
-    *) echo "  · OPENAI_BASE_URL is non-default ($obase) — reranker routed there; ensure it supports logprobs" ;;
+    *api.openai.com*|"")
+      if key_present OPENAI_API_KEY; then echo "  ✓ OPENAI_API_KEY present"
+      elif [ "$llm" = openai ]; then echo "  ✗ OPENAI_API_KEY missing — openai extraction needs it"; bad=1
+      elif [ -z "$rurl" ]; then echo "  ✗ OPENAI_API_KEY missing — the default (OpenAI) reranker needs it"; bad=1
+      else echo "  · OPENAI_API_KEY absent (ok: local reranker + non-openai LLM)"; fi ;;
+    *) echo "  · OPENAI_BASE_URL is non-default ($obase) — openai-routed calls go there" ;;
   esac
   [ "$emb" = gemini ]    && { key_present GOOGLE_API_KEY    && echo "  ✓ GOOGLE_API_KEY present (gemini embedder)"  || { echo "  ✗ GOOGLE_API_KEY missing";    bad=1; }; }
   [ "$llm" = anthropic ] && { key_present ANTHROPIC_API_KEY && echo "  ✓ ANTHROPIC_API_KEY present"                || { echo "  ✗ ANTHROPIC_API_KEY missing"; bad=1; }; }
@@ -186,6 +192,9 @@ cmd_reindex() {
   fi
   echo "  [1/6] backup"; "$SCRIPT_DIR/backup.sh"
   echo "  [2/6] wipe graphs"; for g in $groups; do redis_query "$g" "MATCH (n) DETACH DELETE n" >/dev/null; echo "    wiped $g"; done
+  # Wiped content must be re-ingestable: clear the durable queue's idempotency set too,
+  # or every re-ingested episode would be skipped as "already processed".
+  redis_cmd "DEL aimem:processed" >/dev/null; echo "    cleared idempotency set"
   echo "  [3/6] switch env + restart ($profile)"; deploy_and_up "$profile"
   set_space_marker "$(profile_val "$pf" EMBEDDER_MODEL)/$(profile_val "$pf" EMBEDDER_DIMENSIONS)"
   echo "  [4/6] reset ledgers"; rm -f "$SCRIPT_DIR/migrate/.indexed.json" "$SCRIPT_DIR/migrate/.backfilled.txt" "$SCRIPT_DIR/migrate/.indexed.lock"
