@@ -17,7 +17,11 @@ This replacement keeps the exact public interface of the original QueueService b
     tracked in `aimem:processed` — re-submitting the same episode is a no-op;
   - retries transient failures (rate limit / timeout / connection) with real backoff,
     and parks poison episodes in a dead-letter stream (`aimem:dead`) after MAX_ATTEMPTS
-    instead of losing them — inspect/replay with XRANGE / a small script.
+    instead of losing them — inspect/replay with XRANGE / a small script;
+  - enforces the hygiene gate on the MCP write path when SANITIZER_URL is set:
+    episode content is scrubbed (secrets/PII) at consume time, BEFORE it reaches the
+    extraction LLM or the graph. Fail-closed: a sanitizer failure is a transient
+    error (backoff → dead-letter), never an unscrubbed pass-through.
 
 Installed by the Dockerfile as /app/mcp/src/services/queue_service.py. The companion
 patch-durable-queue.py passes entity_types to initialize() at the server call site.
@@ -30,6 +34,7 @@ import hashlib
 import json
 import logging
 import os
+import urllib.request
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
@@ -47,7 +52,9 @@ GROUP = 'workers'
 CONSUMER = 'main'
 MAX_ATTEMPTS = int(os.environ.get('QUEUE_MAX_ATTEMPTS', '5'))
 TRANSIENT_MARKERS = ('rate limit', '429', 'timeout', 'timed out', 'connection',
-                     'overloaded', '503', '529', 'temporarily')
+                     'overloaded', '503', '529', 'temporarily', 'sanitizer')
+SANITIZER_URL = os.environ.get('SANITIZER_URL', '').rstrip('/')
+SANITIZER_DEPTH = os.environ.get('SANITIZER_DEPTH', 'quick')
 
 
 def _idempotency_key(group_id: str, name: str, source_description: str, content: str) -> str:
@@ -86,6 +93,12 @@ class QueueService:
         self._consumer_task = asyncio.create_task(self._consume())
         backlog = await self._redis.xlen(STREAM)
         logger.info(f'Durable queue service initialized (stream={STREAM}, backlog={backlog})')
+        if SANITIZER_URL:
+            logger.info(f'Hygiene gate ACTIVE: content sanitized via {SANITIZER_URL} '
+                        f'(depth={SANITIZER_DEPTH}) before extraction')
+        else:
+            logger.warning('SANITIZER_URL not set — MCP episodes are ingested UNSANITIZED '
+                           '(secrets/PII reach the extraction LLM and the graph)')
 
     # ── public interface (parity with the stock QueueService) ───────────────
 
@@ -122,6 +135,31 @@ class QueueService:
         async with self._exec_lock:
             await process_func()
         return 0
+
+    # ── hygiene gate ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def _sanitize(text: str) -> str:
+        """Scrub secrets/PII before content reaches the extraction LLM or the graph.
+        Fail-closed by raising: the error message contains 'sanitizer', which the
+        transient classifier matches → backoff and eventually dead-letter, never an
+        unscrubbed pass-through."""
+        if not SANITIZER_URL or not text.strip():
+            return text
+
+        def _call() -> str:
+            req = urllib.request.Request(
+                f'{SANITIZER_URL}/api/sanitize',
+                data=json.dumps({'text': text, 'depth': SANITIZER_DEPTH}).encode('utf-8'),
+                headers={'Content-Type': 'application/json'}, method='POST')
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                body = json.loads(resp.read().decode('utf-8'))
+                return body['sanitized']
+
+        try:
+            return await asyncio.to_thread(_call)
+        except Exception as e:  # noqa: BLE001 — any failure must stay fail-closed
+            raise RuntimeError(f'sanitizer failed ({type(e).__name__}): {e}') from e
 
     # ── consumer ─────────────────────────────────────────────────────────────
 
@@ -164,10 +202,11 @@ class QueueService:
         try:
             logger.info(f'Processing episode {f.get("name", "?")[:60]!r} for group {group_id} '
                         f'(attempt {attempt + 1})')
+            content = await self._sanitize(f.get('content', ''))
             async with self._exec_lock:
                 await self._graphiti_client.add_episode(
                     name=f.get('name', ''),
-                    episode_body=f.get('content', ''),
+                    episode_body=content,
                     source_description=f.get('source_description', ''),
                     source=episode_type,
                     group_id=group_id,
