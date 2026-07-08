@@ -22,6 +22,7 @@
 #   ./memctl.sh reindex --to <profile> [--groups a,b,c] [--dry-run] [--yes]
 #   ./memctl.sh ingest <chunks.jsonl> [--groups a,b] [--batch N]
 #   ./memctl.sh dead-letter --list | --replay [--reason R] [--group G] | --purge --yes
+#   ./memctl.sh dedup --groups a,b [--apply] [--keep oldest|newest]
 #   ./memctl.sh wipe [--groups a,b] [--yes]
 set -euo pipefail
 
@@ -252,6 +253,20 @@ cmd_deadletter() {
   onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/dead_letter.py $*"
 }
 
+# ── dedup: in-place removal of duplicate episodes (ships the tool into the container) ────────
+# The incremental-regime correction path: fixes a duplicated graph WITHOUT a rebuild.
+# Dry-run by default; --apply mutates (the tool itself takes the single-writer lock).
+cmd_dedup() {
+  if [ -n "$MEMORY_HOST" ]; then
+    # shellcheck disable=SC2086
+    scp -O ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$SCRIPT_DIR/migrate/dedup_episodes.py" "$MEMORY_HOST:$MEMORY_DIR/dedup_episodes.py"
+  else
+    cp "$SCRIPT_DIR/migrate/dedup_episodes.py" "$MEMORY_DIR/dedup_episodes.py"
+  fi
+  onhost "$DOCKER cp '$MEMORY_DIR/dedup_episodes.py' $MCP_SVC:/tmp/dedup_episodes.py"
+  onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/dedup_episodes.py $*"
+}
+
 # ── wipe: reset namespaces to empty AND clear the durable-queue state, together ──────────────
 # The trap this closes: wiping a graph but NOT aimem:processed makes re-ingest a no-op (every
 # record is "already processed") -> the graph silently stays empty. Always do both.
@@ -289,6 +304,7 @@ case "${1:-}" in
   reindex)     shift; cmd_reindex "$@" ;;
   ingest)      shift; cmd_ingest "$@" ;;
   dead-letter) shift; cmd_deadletter "$@" ;;
+  dedup)       shift; cmd_dedup "$@" ;;
   wipe)        shift; cmd_wipe "$@" ;;
-  *) echo "memctl.sh — doctor | status | switch <profile> | reindex --to <profile> [...] | ingest <chunks.jsonl> [...] | dead-letter --list|--replay|--purge [...] | wipe [--groups a,b] [--yes]"; list_profiles ;;
+  *) echo "memctl.sh — doctor | status | switch <profile> | reindex --to <profile> [...] | ingest <chunks.jsonl> [...] | dead-letter --list|--replay|--purge [...] | dedup --groups a,b [--apply] | wipe [--groups a,b] [--yes]"; list_profiles ;;
 esac
