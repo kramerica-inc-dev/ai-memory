@@ -21,6 +21,7 @@
 #   ./memctl.sh switch <profile>
 #   ./memctl.sh reindex --to <profile> [--groups a,b,c] [--dry-run] [--yes]
 #   ./memctl.sh ingest <chunks.jsonl> [--groups a,b] [--batch N]
+#   ./memctl.sh enqueue <chunks.jsonl> [--groups a,b]
 #   ./memctl.sh dead-letter --list | --replay [--reason R] [--group G] | --purge --yes
 #   ./memctl.sh dedup --groups a,b [--apply] [--keep oldest|newest]
 #   ./memctl.sh wipe [--groups a,b] [--yes]
@@ -241,6 +242,32 @@ cmd_ingest() {
   onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/bulk_ingest.py $args"
 }
 
+# ── enqueue: serial mass-ingest — feed a JSONL to the durable queue, consumer drains it ──────
+# The SERIAL counterpart of `ingest`: per-episode via the daily-use path (sanitizer, full
+# dedup, dead-letter). Slower but batch-failure-proof; the proven route for dense content.
+cmd_enqueue() {
+  local jsonl="" groups=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --groups) groups="$2"; shift 2;;
+    *)        jsonl="$1"; shift;;
+  esac; done
+  [ -n "$jsonl" ] && [ -f "$jsonl" ] || { echo "✗ usage: memctl enqueue <chunks.jsonl> [--groups a,b]"; return 1; }
+  local base; base="$(basename "$jsonl")"
+  echo "▸ enqueue — $jsonl  (groups=${groups:-all}, serial via durable queue)"
+  if [ -n "$MEMORY_HOST" ]; then
+    # shellcheck disable=SC2086
+    scp -O ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$jsonl" "$MEMORY_HOST:$MEMORY_DIR/$base"
+    # shellcheck disable=SC2086
+    scp -O ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$SCRIPT_DIR/migrate/enqueue.py" "$MEMORY_HOST:$MEMORY_DIR/enqueue.py"
+  else
+    cp "$jsonl" "$MEMORY_DIR/$base"; cp "$SCRIPT_DIR/migrate/enqueue.py" "$MEMORY_DIR/enqueue.py"
+  fi
+  onhost "$DOCKER cp '$MEMORY_DIR/$base' $MCP_SVC:/tmp/$base && $DOCKER cp '$MEMORY_DIR/enqueue.py' $MCP_SVC:/tmp/enqueue.py"
+  local args="/tmp/$base"
+  [ -n "$groups" ] && args="$args --groups $groups"
+  onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/enqueue.py $args"
+}
+
 # ── dead-letter: inspect / replay the quarantine stream (ships the tool into the container) ──
 cmd_deadletter() {
   if [ -n "$MEMORY_HOST" ]; then
@@ -303,6 +330,7 @@ case "${1:-}" in
   switch)      shift; cmd_switch "$@" ;;
   reindex)     shift; cmd_reindex "$@" ;;
   ingest)      shift; cmd_ingest "$@" ;;
+  enqueue)     shift; cmd_enqueue "$@" ;;
   dead-letter) shift; cmd_deadletter "$@" ;;
   dedup)       shift; cmd_dedup "$@" ;;
   wipe)        shift; cmd_wipe "$@" ;;
