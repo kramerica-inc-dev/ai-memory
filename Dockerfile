@@ -30,7 +30,7 @@ RUN sed -i '/temperature=self.temperature,/d' \
 COPY patch-anthropic-client.py /tmp/patch-anthropic-client.py
 RUN /app/mcp/.venv/bin/python /tmp/patch-anthropic-client.py
 
-# Bound each Anthropic request (env LLM_REQUEST_TIMEOUT, default 90s): the client is created with
+# Bound each Anthropic request (env LLM_REQUEST_TIMEOUT, default 200s): the client is created with
 # no timeout (600s SDK default), so a hung extraction call stalls a whole add_episode_bulk batch.
 # See patch-anthropic-timeout.py.
 COPY patch-anthropic-timeout.py /tmp/patch-anthropic-timeout.py

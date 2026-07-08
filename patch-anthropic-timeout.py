@@ -7,7 +7,7 @@ SDK default (600s per request). On entity-dense chunks the extraction call can h
 `add_episode_bulk` a single hung call blocks the WHOLE batch, and the run stalls for tens of
 minutes with idle CPU (observed: a 25-chunk batch not completing in 70+ min).
 
-Fix: pass `timeout=LLM_REQUEST_TIMEOUT` (env, default 90s) to AsyncAnthropic. A hung/slow
+Fix: pass `timeout=LLM_REQUEST_TIMEOUT` (env, default 200s) to AsyncAnthropic. A hung/slow
 call now fails fast -> graphiti's retry loop runs -> our durable-queue / bulk path retries
 and, if it stays bad, DEAD-LETTERS it (visible, replayable) instead of hanging. This makes a
 hung model call just another failure mode that self-corrects, rather than a stall.
@@ -33,10 +33,11 @@ NEW = (
     "            self.client = AsyncAnthropic(\n"
     "                api_key=config.api_key,\n"
     "                max_retries=1,\n"
-    "                # PATCH (ai-memory): bound each request (env LLM_REQUEST_TIMEOUT, default 90s)\n"
+    "                # PATCH (ai-memory): bound each request (env LLM_REQUEST_TIMEOUT, default 200s;\n"
+    "                # dense-document extractions have been observed to need >90s legitimately)\n"
     "                # so a hung/slow extraction call fails fast -> retry -> dead-letter, instead\n"
     "                # of a 600s SDK-default hang that stalls a whole add_episode_bulk batch.\n"
-    "                timeout=float(os.environ.get('LLM_REQUEST_TIMEOUT', '90')),\n"
+    "                timeout=float(os.environ.get('LLM_REQUEST_TIMEOUT', '200')),\n"
     "            )\n"
 )
 
