@@ -22,8 +22,12 @@ SAFETY (this is the mass-ingest path; it must match the daily path's guarantees)
   • IDEMPOTENT — before ingesting a record it checks the SAME idempotency key the queue
     uses (`aimem:processed`); already-ingested records are skipped, so a re-run or an
     overlapping run is a no-op instead of a source of duplicates.
-  • NO SILENT LOSS — a batch that fails after retries is written to the dead-letter
-    stream `aimem:dead` (raw records + error), never dropped with a bare `continue`.
+  • NO SILENT LOSS — a batch that fails is written to the dead-letter stream
+    `aimem:dead` (raw records + error), never dropped with a bare `continue`.
+    There is deliberately NO in-batch retry: add_episode_bulk can PARTIALLY land
+    episodes before raising, so re-submitting the same batch duplicates the landed
+    ones (aimem:processed is only marked after full-batch success). Recovery is the
+    serial dead-letter replay (per-episode queue route), not an in-place retry.
   • OBSERVABLE — publishes `aimem:heartbeat:bulk` so a stall is visible (reconcile shows
     its age/progress) instead of looking identical to a slow-but-healthy run.
 
@@ -53,9 +57,6 @@ HEARTBEAT = "aimem:heartbeat:bulk"
 CONSUMER_HB = "aimem:heartbeat:consumer"
 LOCK_TTL = 240            # seconds; refreshed at half-life, so a crash/kill frees it in <=4min
                           # (the finally-block releases it immediately on a clean/handled exit)
-MAX_BATCH_ATTEMPTS = 3    # transient failures get retried before dead-lettering
-TRANSIENT = ("rate limit", "429", "timeout", "timed out", "connection",
-             "overloaded", "503", "529", "temporarily")
 # Deterministic failure categories for the dead-letter (mirrors queue_service_durable).
 _FAILURE_MARKERS = (
     ("truncation", ("eof while parsing", "unterminated", "max_tokens", "truncat", "unexpected end")),
@@ -186,7 +187,7 @@ def build_client():
 
 
 async def ingest_batch(g, r, grp, batch, custom, now):
-    """Ingest one batch idempotently, with transient-retry, else dead-letter.
+    """Ingest one batch idempotently; any failure dead-letters the whole batch.
     Returns (ingested_count, nodes, edges, dead_count)."""
     fresh = [rec for rec in batch if not await r.sismember(PROCESSED, _rec_key(rec))]
     if not fresh:
@@ -194,32 +195,28 @@ async def ingest_batch(g, r, grp, batch, custom, now):
     eps = [RawEpisode(name=rec["name"], content=rec["content"],
                       source_description=rec.get("source_description", ""),
                       source=EpisodeType.text, reference_time=now) for rec in fresh]
-    for attempt in range(1, MAX_BATCH_ATTEMPTS + 1):
-        try:
-            res = await g.add_episode_bulk(eps, group_id=grp, entity_types=custom)
-            if fresh:
-                await r.sadd(PROCESSED, *[_rec_key(rec) for rec in fresh])
-            n = len(getattr(res, "nodes", []) or [])
-            e = len(getattr(res, "edges", []) or [])
-            return len(fresh), n, e, 0
-        except Exception as exc:  # noqa: BLE001
-            msg = str(exc)
-            transient = any(m in msg.lower() for m in TRANSIENT)
-            print(f"  [{grp}] batch attempt {attempt}/{MAX_BATCH_ATTEMPTS} "
-                  f"{'transient ' if transient else ''}FAIL: {type(exc).__name__}: {msg[:120]}")
-            if transient and attempt < MAX_BATCH_ATTEMPTS:
-                await asyncio.sleep(min(30 * attempt, 120))
-                continue
-            # Give up -> quarantine every record in this batch (never a silent drop).
-            reason = _classify_failure(msg)
-            for rec in fresh:
-                await r.xadd(DEAD, {"group": grp, "name": rec["name"],
-                                    "content": rec["content"],
-                                    "source_description": rec.get("source_description", ""),
-                                    "key": _rec_key(rec), "error": msg[:400], "reason": reason,
-                                    "failed_at": datetime.now(timezone.utc).isoformat()})
-            print(f"  [{grp}] dead-lettered {len(fresh)} record(s) (reason={reason})")
-            return 0, 0, 0, len(fresh)
+    try:
+        res = await g.add_episode_bulk(eps, group_id=grp, entity_types=custom)
+        await r.sadd(PROCESSED, *[_rec_key(rec) for rec in fresh])
+        n = len(getattr(res, "nodes", []) or [])
+        e = len(getattr(res, "edges", []) or [])
+        return len(fresh), n, e, 0
+    except Exception as exc:  # noqa: BLE001
+        # NO retry here: add_episode_bulk may have PARTIALLY landed episodes before the
+        # exception, so re-submitting `eps` would duplicate them (observed: 60 dup
+        # episodes in one rebuild). Quarantine the batch; the serial dead-letter replay
+        # is the safe recovery path.
+        msg = str(exc)
+        reason = _classify_failure(msg)
+        print(f"  [{grp}] batch FAIL: {type(exc).__name__}: {msg[:120]}")
+        for rec in fresh:
+            await r.xadd(DEAD, {"group": grp, "name": rec["name"],
+                                "content": rec["content"],
+                                "source_description": rec.get("source_description", ""),
+                                "key": _rec_key(rec), "error": msg[:400], "reason": reason,
+                                "failed_at": datetime.now(timezone.utc).isoformat()})
+        print(f"  [{grp}] dead-lettered {len(fresh)} record(s) (reason={reason})")
+        return 0, 0, 0, len(fresh)
 
 
 async def main():
