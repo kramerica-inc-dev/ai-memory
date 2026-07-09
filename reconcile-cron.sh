@@ -7,10 +7,13 @@
 # DSM setup (one-time, GUI): Control Panel → Task Scheduler → Create → Scheduled
 # task → User-defined script; user: <your user>; daily;
 # script:  bash /volume1/docker/ai-memory/reconcile-cron.sh
-# Output lands in $DIR/reconcile.log.
+# Output goes to BOTH stdout and $DIR/reconcile.log.
 #
 # ALERTING: enable "Send run details by email" + "only when the script terminates
 # abnormally" on the DSM task — findings/critical exit nonzero, so that mails you.
+# The report is printed to stdout ON PURPOSE so it lands in that mail body: an
+# earlier `exec >>log` swallowed it and the alert mail arrived empty — a signal
+# with no diagnosis (observed 2026-07-09).
 # (synodsmnotify is useless here: DSM only accepts pre-registered i18n title keys.)
 #
 # Exit codes follow reconcile.py: 0 = clean · 1 = findings · 2 = critical.
@@ -19,24 +22,30 @@ set -uo pipefail
 DIR=${AIMEM_DIR:-/volume1/docker/ai-memory}
 LOG="$DIR/reconcile.log"
 
-exec >>"$LOG" 2>&1
-echo "== reconcile $(date '+%Y-%m-%d %H:%M:%S') =="
+main() {
+  echo "== reconcile $(date '+%Y-%m-%d %H:%M:%S') =="
 
-# reconcile.py runs locally on the NAS: empty MEMORY_HOST = local docker.
-export MEMORY_HOST=""
-export MEMORY_DIR="$DIR"
-export DOCKER=${DOCKER:-/usr/local/bin/docker}
-export MAPPING_CONFIG="$DIR/config/mapping.yaml"
+  # reconcile.py runs locally on the NAS: empty MEMORY_HOST = local docker.
+  export MEMORY_HOST=""
+  export MEMORY_DIR="$DIR"
+  export DOCKER=${DOCKER:-/usr/local/bin/docker}
+  export MAPPING_CONFIG="$DIR/config/mapping.yaml"
 
-python3 "$DIR/migrate/reconcile.py" --fix
-rc=$?
+  python3 "$DIR/migrate/reconcile.py" --fix
+  local rc=$?
 
-if [ "$rc" -ne 0 ]; then
-  sev=$([ "$rc" -ge 2 ] && echo "CRITICAL" || echo "findings")
-  echo "reconcile exit=$rc ($sev) — see above"
-else
-  echo "ok — all invariants hold"
-fi
+  if [ "$rc" -ne 0 ]; then
+    local sev
+    sev=$([ "$rc" -ge 2 ] && echo "CRITICAL" || echo "findings")
+    echo "reconcile exit=$rc ($sev) — see above"
+  else
+    echo "ok — all invariants hold"
+  fi
+  return "$rc"
+}
+
+main 2>&1 | tee -a "$LOG"
+rc=${PIPESTATUS[0]}
 
 # keep the log bounded (~last 2000 lines)
 tail -n 2000 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
