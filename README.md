@@ -68,17 +68,28 @@ cp memctl.conf.example memctl.conf          # set MEMORY_HOST/MEMORY_DIR/MEMORY_
 ./memctl.sh reindex --to local-embedder     # guarded, destructive embedder swap (wipe + re-embed)
 ```
 
-Profiles live in `profiles/*.env` (openai-cloud, gemini, claude, local-embedder,
+Profiles live in `profiles/*.env` (openai-cloud, gemini, claude, haiku, local-embedder,
 local-embedder-remote, local-ollama). A **switch** is a cheap LLM-only swap; changing the
 **embedder** model/dimension invalidates stored vectors and must go through **reindex**.
 
-## The two ingest routes
+## The ingest routes
 
+- **Serial mass-ingest (rebuild/backfill)** — `./memctl.sh enqueue <chunks.jsonl>` feeds a JSONL
+  dump onto the durable queue; the live consumer drains it one episode at a time through the exact
+  daily-use path (sanitizer, full per-episode dedup, bounded retry, dead-letter). Slower than bulk
+  but batch-failure-proof — the proven route for rebuilds and dense documents.
 - **Bulk (onboarding)** — read an existing library of files/notes in one pass.
-  `migrate/index_files.py --dump` (or `migrate/backfill.py`) produces JSONL; `migrate/bulk_ingest.py`
+  `migrate/index_files.py --dump` (or `migrate/backfill.py`) produces JSONL; `./memctl.sh ingest`
   runs `add_episode_bulk` inside the container. Far fewer LLM/embed/DB calls than per-episode.
+  Deliberately no in-batch retry: `add_episode_bulk` can partially land episodes before raising,
+  so a retry would duplicate them — failed batches dead-letter instead, for serial replay.
 - **`add_memory` (daily)** — incremental, full per-episode dedup. This is what MCP clients call
   during normal use, and what `backfill.py`/`index_files.py` use without `--dump`.
+
+In-place correction, no rebuilds: `./memctl.sh dedup --groups <g> [--apply]` removes duplicate
+episodes (same name + source_description) via graphiti's own `remove_episode`, so facts shared
+with surviving episodes stay intact (dry-run by default). `./memctl.sh dead-letter
+--list|--replay|--purge` inspects and idempotently replays quarantined episodes.
 
 Optional file layers: `migrate/mirror.sh` mirrors your projects one-way to the host (so search
 results can point back at real files), and `migrate/index_files.py` indexes their content into the

@@ -54,8 +54,13 @@ MCP clients ─HTTP/MCP─► Caddy :8000 ─► graphiti-mcp ─► FalkorDB
   destructive reindex. `switch` refuses embedder changes to prevent silent 0-result search.
 - **Dimension consistency guard** — `EMBEDDER_DIMENSIONS` must equal `EMBEDDING_DIM`; otherwise
   vector search breaks after a FalkorDB restart. `memctl doctor` asserts this on the live env.
-- **Bulk vs per-episode ingest** — bulk (`add_episode_bulk`) dedups across a whole batch in one
-  pass for cheap onboarding; per-episode (`add_memory`) does full dedup for accurate daily writes.
+- **Three ingest routes** — bulk (`add_episode_bulk`) dedups across a whole batch in one pass for
+  cheap onboarding; serial (`memctl enqueue` → durable queue) trades speed for per-episode
+  isolation, the route for rebuilds and dense content; per-episode (`add_memory`) does full dedup
+  for accurate daily writes. Bulk deliberately has NO in-batch retry: a batch can partially land
+  before an exception, so re-submitting would duplicate episodes — failures dead-letter instead,
+  and `memctl dedup` corrects duplicate episodes in place (via `remove_episode`, shared facts
+  survive) so a corrupted graph never needs a from-scratch rebuild.
 - **Sanitizer hygiene gate** — all ingest paths scrub text through a secret-sanitizer *before* it
   reaches the LLM or the graph, fail-closed (no sanitizer reachable = no ingest), so credentials
   and PII never leak into memory. Detected secrets belong in your own secret manager, not the graph.
