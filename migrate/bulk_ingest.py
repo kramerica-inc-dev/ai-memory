@@ -20,13 +20,13 @@ SAFETY (this is the mass-ingest path; it must match the daily path's guarantees)
     PAUSES while we hold it, so the two never write the same graph concurrently.
     The lock carries a TTL and is refreshed, so a crashed run frees it within the TTL.
   • IDEMPOTENT — before ingesting a record it checks the SAME idempotency key the queue
-    uses (`aimem:processed`); already-ingested records are skipped, so a re-run or an
-    overlapping run is a no-op instead of a source of duplicates.
+    uses (per-group set `aimem:processed:<group>`); already-ingested records are skipped,
+    so a re-run or an overlapping run is a no-op instead of a source of duplicates.
   • NO SILENT LOSS — a batch that fails is written to the dead-letter stream
     `aimem:dead` (raw records + error), never dropped with a bare `continue`.
     There is deliberately NO in-batch retry: add_episode_bulk can PARTIALLY land
     episodes before raising, so re-submitting the same batch duplicates the landed
-    ones (aimem:processed is only marked after full-batch success). Recovery is the
+    ones (the processed-set is only marked after full-batch success). Recovery is the
     serial dead-letter replay (per-episode queue route), not an in-place retry.
   • OBSERVABLE — publishes `aimem:heartbeat:bulk` so a stall is visible (reconcile shows
     its age/progress) instead of looking identical to a slow-but-healthy run.
@@ -51,7 +51,7 @@ from graphiti_core.utils.bulk_utils import RawEpisode
 from graphiti_core.nodes import EpisodeType
 
 WRITER_LOCK = "aimem:writer-lock"
-PROCESSED = "aimem:processed"
+PROCESSED_PREFIX = "aimem:processed:"   # per-group sets, shared with queue_service_durable
 DEAD = "aimem:dead"
 HEARTBEAT = "aimem:heartbeat:bulk"
 CONSUMER_HB = "aimem:heartbeat:consumer"
@@ -85,6 +85,10 @@ def _idem_key(group_id: str, name: str, source_description: str, content: str) -
 
 def _rec_key(r: dict) -> str:
     return _idem_key(r["group"], r["name"], r.get("source_description", ""), r["content"])
+
+
+def _processed_set(group_id: str) -> str:
+    return f"{PROCESSED_PREFIX}{group_id}"
 
 
 def redis_connect() -> aioredis.Redis:
@@ -189,7 +193,7 @@ def build_client():
 async def ingest_batch(g, r, grp, batch, custom, now):
     """Ingest one batch idempotently; any failure dead-letters the whole batch.
     Returns (ingested_count, nodes, edges, dead_count)."""
-    fresh = [rec for rec in batch if not await r.sismember(PROCESSED, _rec_key(rec))]
+    fresh = [rec for rec in batch if not await r.sismember(_processed_set(grp), _rec_key(rec))]
     if not fresh:
         return 0, 0, 0, 0
     eps = [RawEpisode(name=rec["name"], content=rec["content"],
@@ -197,7 +201,7 @@ async def ingest_batch(g, r, grp, batch, custom, now):
                       source=EpisodeType.text, reference_time=now) for rec in fresh]
     try:
         res = await g.add_episode_bulk(eps, group_id=grp, entity_types=custom)
-        await r.sadd(PROCESSED, *[_rec_key(rec) for rec in fresh])
+        await r.sadd(_processed_set(grp), *[_rec_key(rec) for rec in fresh])
         n = len(getattr(res, "nodes", []) or [])
         e = len(getattr(res, "edges", []) or [])
         return len(fresh), n, e, 0

@@ -91,6 +91,12 @@ episodes (same name + source_description) via graphiti's own `remove_episode`, s
 with surviving episodes stay intact (dry-run by default). `./memctl.sh dead-letter
 --list|--replay|--purge` inspects and idempotently replays quarantined episodes.
 
+All routes share per-group idempotency sets (`aimem:processed:<group>`), so re-submitting a landed
+episode is a no-op and `./memctl.sh wipe --groups <g>` stays surgical: it clears only those groups'
+graphs, processed-keys and queue/dead entries — never another namespace's state. Deployments coming
+from the older single global set migrate once with `./memctl.sh split-processed` (idempotent,
+dry-run by default; see the tool's docstring for the cutover order).
+
 Optional file layers: `migrate/mirror.sh` mirrors your projects one-way to the host (so search
 results can point back at real files), and `migrate/index_files.py` indexes their content into the
 graph. `migrate/verify_index.py` checks that queued chunks actually landed.

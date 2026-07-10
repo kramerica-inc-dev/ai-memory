@@ -24,6 +24,7 @@
 #   ./memctl.sh enqueue <chunks.jsonl> [--groups a,b]
 #   ./memctl.sh dead-letter --list | --replay [--reason R] [--group G] | --purge --yes
 #   ./memctl.sh dedup --groups a,b [--apply] [--keep oldest|newest]
+#   ./memctl.sh split-processed --groups a,b [--dump f.jsonl] [--from-graph] [--apply] [--retire]
 #   ./memctl.sh wipe [--groups a,b] [--yes]
 set -euo pipefail
 
@@ -71,6 +72,18 @@ redis_cmd() {
 SPACE_KEY="aimem:embedding_space"
 set_space_marker() { redis_cmd "SET $SPACE_KEY $1" >/dev/null; }
 get_space_marker() { redis_cmd "GET $SPACE_KEY" | tr -d '\r'; }
+
+# Ship a migrate/ tool into the MCP container as /tmp/<name> (remote or local target).
+ship_tool() {
+  local name="$1"
+  if [ -n "$MEMORY_HOST" ]; then
+    # shellcheck disable=SC2086 — MEMORY_SSH_OPTS is intentionally word-split into flags
+    scp -O ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$SCRIPT_DIR/migrate/$name" "$MEMORY_HOST:$MEMORY_DIR/$name"
+  else
+    cp "$SCRIPT_DIR/migrate/$name" "$MEMORY_DIR/$name"
+  fi
+  onhost "$DOCKER cp '$MEMORY_DIR/$name' $MCP_SVC:/tmp/$name"
+}
 
 mcp_env() { onhost "$DOCKER exec $MCP_SVC printenv" 2>/dev/null; }
 active_profile() { onhost "cat '$MEMORY_DIR/.active-profile' 2>/dev/null" || true; }
@@ -200,9 +213,12 @@ cmd_reindex() {
   fi
   echo "  [1/6] backup"; "$SCRIPT_DIR/backup.sh"
   echo "  [2/6] wipe graphs"; for g in $groups; do redis_query "$g" "MATCH (n) DETACH DELETE n" >/dev/null; echo "    wiped $g"; done
-  # Wiped content must be re-ingestable: clear the durable queue's idempotency set too,
-  # or every re-ingested episode would be skipped as "already processed".
-  redis_cmd "DEL aimem:processed" >/dev/null; echo "    cleared idempotency set"
+  # Wiped content must be re-ingestable: clear those groups' idempotency sets too, or
+  # every re-ingested episode would be skipped as "already processed". Sets are per
+  # group, so a partial reindex leaves the other namespaces' processed-keys intact.
+  for g in $groups; do redis_cmd "DEL aimem:processed:$g" >/dev/null; done
+  redis_cmd "DEL aimem:processed" >/dev/null   # legacy pre-split global set, if any
+  echo "    cleared idempotency set(s): $groups"
   echo "  [3/6] switch env + restart ($profile)"; deploy_and_up "$profile"
   set_space_marker "$(profile_val "$pf" EMBEDDER_MODEL)/$(profile_val "$pf" EMBEDDER_DIMENSIONS)"
   echo "  [4/6] reset ledgers"; rm -f "$SCRIPT_DIR/migrate/.indexed.json" "$SCRIPT_DIR/migrate/.backfilled.txt" "$SCRIPT_DIR/migrate/.indexed.lock"
@@ -270,13 +286,7 @@ cmd_enqueue() {
 
 # ── dead-letter: inspect / replay the quarantine stream (ships the tool into the container) ──
 cmd_deadletter() {
-  if [ -n "$MEMORY_HOST" ]; then
-    # shellcheck disable=SC2086
-    scp -O ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$SCRIPT_DIR/migrate/dead_letter.py" "$MEMORY_HOST:$MEMORY_DIR/dead_letter.py"
-  else
-    cp "$SCRIPT_DIR/migrate/dead_letter.py" "$MEMORY_DIR/dead_letter.py"
-  fi
-  onhost "$DOCKER cp '$MEMORY_DIR/dead_letter.py' $MCP_SVC:/tmp/dead_letter.py"
+  ship_tool dead_letter.py
   onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/dead_letter.py $*"
 }
 
@@ -284,19 +294,24 @@ cmd_deadletter() {
 # The incremental-regime correction path: fixes a duplicated graph WITHOUT a rebuild.
 # Dry-run by default; --apply mutates (the tool itself takes the single-writer lock).
 cmd_dedup() {
-  if [ -n "$MEMORY_HOST" ]; then
-    # shellcheck disable=SC2086
-    scp -O ${MEMORY_SSH_OPTS:-} -o ConnectTimeout=15 -o LogLevel=ERROR "$SCRIPT_DIR/migrate/dedup_episodes.py" "$MEMORY_HOST:$MEMORY_DIR/dedup_episodes.py"
-  else
-    cp "$SCRIPT_DIR/migrate/dedup_episodes.py" "$MEMORY_DIR/dedup_episodes.py"
-  fi
-  onhost "$DOCKER cp '$MEMORY_DIR/dedup_episodes.py' $MCP_SVC:/tmp/dedup_episodes.py"
+  ship_tool dedup_episodes.py
   onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/dedup_episodes.py $*"
 }
 
-# ── wipe: reset namespaces to empty AND clear the durable-queue state, together ──────────────
-# The trap this closes: wiping a graph but NOT aimem:processed makes re-ingest a no-op (every
-# record is "already processed") -> the graph silently stays empty. Always do both.
+# ── split-processed: one-time migration of the legacy global idempotency set ─────────────────
+# Populates the per-group sets (aimem:processed:<g>) from dump files and/or the graphs.
+# Idempotent; dry-run by default. See migrate/split_processed.py for the full contract.
+cmd_splitprocessed() {
+  ship_tool split_processed.py
+  onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/split_processed.py $*"
+}
+
+# ── wipe: reset namespaces to empty AND clear their durable-queue state, together ────────────
+# The trap this closes: wiping a graph but NOT its processed-keys makes re-ingest a no-op
+# (every record is "already processed") -> the graph silently stays empty. Idempotency sets
+# are per group (aimem:processed:<g>) so a scoped wipe clears exactly its own keys; the shared
+# queue/dead streams are purged per group (queue_purge.py), never DELed whole — a whole-stream
+# DEL would drop OTHER groups' pending episodes (same collateral class as a global set).
 cmd_wipe() {
   local groups="" yes=""
   while [ $# -gt 0 ]; do case "$1" in
@@ -307,21 +322,36 @@ cmd_wipe() {
   groups_or_die
   local targets="${groups:-$MEMORY_GROUPS}"
   echo "▸ wipe — namespaces: $targets"
-  echo "  wipes those graphs AND aimem:processed/queue/dead (so re-ingest is not a silent no-op)"
+  if [ -z "$groups" ]; then
+    echo "  FULL wipe: graphs + processed-sets + whole queue/dead streams + writer-lock"
+  else
+    echo "  scoped wipe: those graphs + their processed-sets + their queue/dead entries"
+    echo "  (other groups' processed-keys and pending/dead entries stay untouched)"
+  fi
   if [ -z "$yes" ]; then
-    printf "  This WIPES the graphs above + the durable-queue state. Type 'wipe' to proceed: "
+    printf "  This WIPES the graphs above + their durable-queue state. Type 'wipe' to proceed: "
     local ans; read -r ans; [ "$ans" = wipe ] || { echo "  aborted."; return 1; }
   fi
   echo "  [1/3] backup"; "$SCRIPT_DIR/backup.sh" >/dev/null && echo "    backup ok"
   echo "  [2/3] wipe graphs"; for g in $targets; do redis_query "$g" "MATCH (n) DETACH DELETE n" >/dev/null; echo "    wiped $g"; done
   echo "  [3/3] clear durable-queue state"
-  redis_cmd "DEL aimem:processed" >/dev/null; redis_cmd "DEL aimem:queue" >/dev/null; redis_cmd "DEL aimem:dead" >/dev/null
-  # DEL aimem:queue drops the consumer group -> the live consumer would loop on NOGROUP until it
-  # self-heals. Recreate the empty stream+group here so it never even notices (BUSYGROUP = fine).
-  redis_cmd "XGROUP CREATE aimem:queue workers 0 MKSTREAM" >/dev/null 2>&1 || true
-  redis_cmd "DEL aimem:writer-lock" >/dev/null
-  echo "    cleared aimem:processed / aimem:queue / aimem:dead; recreated queue group; freed writer-lock"
-  echo "✓ wipe complete. Verify with migrate/reconcile.py (all groups empty, backlog/dead 0)."
+  for g in $targets; do redis_cmd "DEL aimem:processed:$g" >/dev/null; done
+  redis_cmd "DEL aimem:processed" >/dev/null   # legacy pre-split global set, if any
+  if [ -z "$groups" ]; then
+    redis_cmd "DEL aimem:queue" >/dev/null; redis_cmd "DEL aimem:dead" >/dev/null
+    # DEL aimem:queue drops the consumer group -> the live consumer would loop on NOGROUP until
+    # it self-heals. Recreate the empty stream+group here so it never even notices (BUSYGROUP = fine).
+    redis_cmd "XGROUP CREATE aimem:queue workers 0 MKSTREAM" >/dev/null 2>&1 || true
+    redis_cmd "DEL aimem:writer-lock" >/dev/null
+    echo "    cleared all processed-sets + queue/dead; recreated queue group; freed writer-lock"
+  else
+    local csv="${targets// /,}"
+    ship_tool queue_purge.py
+    onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/queue_purge.py --stream queue --groups $csv --yes"
+    onhost "$DOCKER exec $MCP_SVC /app/mcp/.venv/bin/python -u /tmp/queue_purge.py --stream dead --groups $csv --yes"
+    echo "    cleared processed-sets + queue/dead entries of: $targets (other groups untouched)"
+  fi
+  echo "✓ wipe complete. Verify with migrate/reconcile.py (wiped groups empty, backlog/dead consistent)."
 }
 
 case "${1:-}" in
@@ -333,6 +363,7 @@ case "${1:-}" in
   enqueue)     shift; cmd_enqueue "$@" ;;
   dead-letter) shift; cmd_deadletter "$@" ;;
   dedup)       shift; cmd_dedup "$@" ;;
+  split-processed) shift; cmd_splitprocessed "$@" ;;
   wipe)        shift; cmd_wipe "$@" ;;
-  *) echo "memctl.sh — doctor | status | switch <profile> | reindex --to <profile> [...] | ingest <chunks.jsonl> [...] | dead-letter --list|--replay|--purge [...] | dedup --groups a,b [--apply] | wipe [--groups a,b] [--yes]"; list_profiles ;;
+  *) echo "memctl.sh — doctor | status | switch <profile> | reindex --to <profile> [...] | ingest <chunks.jsonl> [...] | dead-letter --list|--replay|--purge [...] | dedup --groups a,b [--apply] | split-processed --groups a,b [...] | wipe [--groups a,b] [--yes]"; list_profiles ;;
 esac

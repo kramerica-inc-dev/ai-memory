@@ -13,8 +13,8 @@ The second mass-ingest route, complementing bulk_ingest.py:
 
 This tool only ENQUEUES (fast, no LLM); the drain is the consumer's job. Progress is
 visible via aimem:heartbeat:consumer and XLEN aimem:queue (migrate/reconcile.py shows
-both). Idempotent: records whose key is already in aimem:processed are skipped, so a
-re-run tops up instead of duplicating.
+both). Idempotent: records whose key is already in the per-group idempotency set
+(aimem:processed:<group>) are skipped, so a re-run tops up instead of duplicating.
 
 Runs INSIDE the graphiti-mcp container. Invoke via `memctl enqueue …`, or directly:
   enqueue.py /tmp/chunks.jsonl                          # all groups
@@ -26,13 +26,17 @@ from urllib.parse import urlparse
 import redis.asyncio as aioredis
 
 QUEUE = "aimem:queue"
-PROCESSED = "aimem:processed"
+PROCESSED_PREFIX = "aimem:processed:"   # per-group sets, shared with queue_service_durable
 
 
 def _idem_key(group_id: str, name: str, source_description: str, content: str) -> str:
     """MUST match queue_service_durable._idempotency_key so the two paths share state."""
     raw = f"{group_id}|{name}|{source_description}|{content}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _processed_set(group_id: str) -> str:
+    return f"{PROCESSED_PREFIX}{group_id}"
 
 
 def redis_connect() -> aioredis.Redis:
@@ -67,7 +71,7 @@ async def main():
         for rec in recs:
             grp = rec["group"]
             key = _idem_key(grp, rec["name"], rec.get("source_description", ""), rec["content"])
-            if await r.sismember(PROCESSED, key):
+            if await r.sismember(_processed_set(grp), key):
                 skip[grp] += 1
                 continue
             # Exact field shape of queue_service_durable.add_episode — the consumer

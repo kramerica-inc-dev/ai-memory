@@ -14,7 +14,8 @@ This replacement keeps the exact public interface of the original QueueService b
   - processes with ONE global consumer → strict serialization across all groups, which
     removes the cross-group corruption class entirely (no shared-driver interleaving);
   - deduplicates via an idempotency key (sha256 of group|name|source_description|content)
-    tracked in `aimem:processed` — re-submitting the same episode is a no-op;
+    tracked in a PER-GROUP set `aimem:processed:<group_id>` — re-submitting the same
+    episode is a no-op, and wiping one namespace never clears another group's keys;
   - retries transient failures (rate limit / timeout / connection) with real backoff,
     and parks poison episodes in a dead-letter stream (`aimem:dead`) after MAX_ATTEMPTS
     instead of losing them — inspect/replay with XRANGE / a small script;
@@ -54,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 STREAM = 'aimem:queue'
 DEAD = 'aimem:dead'
-PROCESSED = 'aimem:processed'
+PROCESSED_PREFIX = 'aimem:processed:'    # per-group idempotency sets (see _processed_set)
 HEARTBEAT = 'aimem:heartbeat:consumer'   # {state, ts, count, name}, refreshed each step
 WRITER_LOCK = 'aimem:writer-lock'        # held by bulk_ingest during a mass run
 GROUP = 'workers'
@@ -69,6 +70,14 @@ SANITIZER_DEPTH = os.environ.get('SANITIZER_DEPTH', 'quick')
 def _idempotency_key(group_id: str, name: str, source_description: str, content: str) -> str:
     raw = f'{group_id}|{name}|{source_description}|{content}'
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:32]
+
+
+def _processed_set(group_id: str) -> str:
+    """Idempotency keys live in one set PER group, so a namespace wipe clears exactly its
+    own keys. A single global set made `memctl wipe --groups X` collateral-delete every
+    other group's keys (members are opaque hashes — not attributable to a group), after
+    which a replay/re-enqueue could re-ingest already-landed episodes as duplicates."""
+    return f'{PROCESSED_PREFIX}{group_id}'
 
 
 # Deterministic, provider-agnostic failure categories for the dead-letter — so a quarantined
@@ -142,7 +151,7 @@ class QueueService:
         if entity_types is not None:
             self._entity_types = entity_types
         key = _idempotency_key(group_id, name, source_description, content)
-        if await self._redis.sismember(PROCESSED, key):
+        if await self._redis.sismember(_processed_set(group_id), key):
             logger.info(f'Skipping duplicate episode (idempotency key {key}) for group {group_id}')
             return await self._redis.xlen(STREAM)
         await self._redis.xadd(STREAM, {
@@ -270,7 +279,7 @@ class QueueService:
         assert self._redis is not None
         group_id, key = f.get('group_id', ''), f.get('key', '')
         attempt = int(f.get('attempt', '0'))
-        if key and await self._redis.sismember(PROCESSED, key):
+        if key and await self._redis.sismember(_processed_set(group_id), key):
             await self._ack(entry_id)
             return
         try:
@@ -296,7 +305,7 @@ class QueueService:
                     uuid=f.get('uuid') or None,
                 )
             if key:
-                await self._redis.sadd(PROCESSED, key)
+                await self._redis.sadd(_processed_set(group_id), key)
             await self._ack(entry_id)
             self._count += 1
             logger.info(f'Successfully processed episode for group {group_id}')

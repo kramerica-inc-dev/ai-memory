@@ -15,8 +15,8 @@ via `memctl dead-letter …`, or directly:
   dead_letter.py --replay --group tbo           # only that group
   dead_letter.py --purge --reason refusal --yes # drop WITHOUT replay (guarded)
 
-Replay is idempotent: an entry whose idempotency key is already in aimem:processed (it
-landed since it was parked) is dropped, not re-ingested. Re-enqueued items go back through
+Replay is idempotent: an entry whose idempotency key is already in its group's processed
+set (it landed since it was parked) is dropped, not re-ingested. Re-enqueued items go back through
 the normal consumer (single-writer, sanitizer, dead-letter) — so a replay can itself
 re-quarantine a still-poison episode instead of looping forever.
 """
@@ -27,7 +27,11 @@ import redis.asyncio as aioredis
 
 DEAD = "aimem:dead"
 QUEUE = "aimem:queue"
-PROCESSED = "aimem:processed"
+PROCESSED_PREFIX = "aimem:processed:"   # per-group sets, shared with queue_service_durable
+
+
+def _processed_set(group_id: str) -> str:
+    return f"{PROCESSED_PREFIX}{group_id}"
 
 
 def redis_connect() -> aioredis.Redis:
@@ -96,7 +100,7 @@ async def main():
         replayed = already = 0
         for eid, f in sel:
             key = f.get("key", "")
-            if key and await r.sismember(PROCESSED, key):
+            if key and await r.sismember(_processed_set(_group(f)), key):
                 await r.xdel(DEAD, eid)          # landed since it was parked -> just drop
                 already += 1
                 continue
