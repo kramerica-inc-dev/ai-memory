@@ -56,17 +56,24 @@ or in `.mcp.json` (project) / user config:
 
 ## Claude Desktop  (`claude_desktop_config.json`)
 
-Claude Desktop historically expects a stdio command; bridge an HTTP server with `mcp-remote`:
+Claude Desktop historically expects a stdio command; bridge an HTTP server with `mcp-remote`.
+Two pitfalls: without `--allow-http`, mcp-remote refuses any non-HTTPS URL except localhost
+("Server disconnected"), and the auth header goes as a `--header` argument — not as a
+`headers` object like the HTTP clients above:
 ```json
 {
   "mcpServers": {
     "memory": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "http://your-memory-host:8000/mcp"]
+      "args": ["-y", "mcp-remote", "http://your-memory-host:8000/mcp", "--allow-http",
+               "--header", "Authorization: Bearer <token>"]
     }
   }
 }
 ```
+(Plain http is fine when the transport is already encrypted, e.g. a WireGuard/Tailscale
+tunnel. Fully quit and reopen Claude Desktop after any config change; verify via the
+sliders icon in the chat input → `memory` connector → smoke-test the `get_status` tool.)
 
 ## Per-project instruction (example in `CLAUDE.md`)
 
