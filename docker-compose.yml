@@ -33,7 +33,7 @@ services:
       # TIMEOUT, so that is left out). NOTE: dedup queries scale poorly with group size — on a large
       # group (200+ episodes) a single add_episode can take minutes, so the timeouts are generous
       # (5 min default / 10 min max) to avoid dropping episodes mid-ingest. See docs/DEPLOY.md.
-      - FALKORDB_ARGS=${FALKORDB_ARGS:-MAX_QUEUED_QUERIES 500 TIMEOUT_DEFAULT 300000 TIMEOUT_MAX 600000 RESULTSET_SIZE 10000}
+      - FALKORDB_ARGS=${FALKORDB_ARGS:-MAX_QUEUED_QUERIES 500 TIMEOUT_DEFAULT 900000 TIMEOUT_MAX 1800000 RESULTSET_SIZE 10000}
     expose:
       - "6379"                          # internal only, for graphiti-mcp
     volumes:
