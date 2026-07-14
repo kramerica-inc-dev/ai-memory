@@ -91,6 +91,10 @@ episodes (same name + source_description) via graphiti's own `remove_episode`, s
 with surviving episodes stay intact (dry-run by default). `./memctl.sh dead-letter
 --list|--replay|--purge` inspects and idempotently replays quarantined episodes.
 
+Roadmap: the bulk route will run its LLM calls through the **Message Batches API** (50% token
+discount, same structured-output guarantees) — accepted design in
+[`docs/DESIGN-batch-bulk-ingest.md`](docs/DESIGN-batch-bulk-ingest.md).
+
 All routes share per-group idempotency sets (`aimem:processed:<group>`), so re-submitting a landed
 episode is a no-op and `./memctl.sh wipe --groups <g>` stays surgical: it clears only those groups'
 graphs, processed-keys and queue/dead entries — never another namespace's state. Deployments coming

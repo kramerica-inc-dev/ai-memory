@@ -60,7 +60,9 @@ MCP clients ─HTTP/MCP─► Caddy :8000 ─► graphiti-mcp ─► FalkorDB
   for accurate daily writes. Bulk deliberately has NO in-batch retry: a batch can partially land
   before an exception, so re-submitting would duplicate episodes — failures dead-letter instead,
   and `memctl dedup` corrects duplicate episodes in place (via `remove_episode`, shared facts
-  survive) so a corrupted graph never needs a from-scratch rebuild.
+  survive) so a corrupted graph never needs a from-scratch rebuild. Accepted direction: the bulk
+  route's LLM calls move to the Message Batches API (50% cheaper, latency-irrelevant for
+  onboarding) — see `docs/DESIGN-batch-bulk-ingest.md`.
 - **Sanitizer hygiene gate** — all ingest paths scrub text through a secret-sanitizer *before* it
   reaches the LLM or the graph, fail-closed (no sanitizer reachable = no ingest), so credentials
   and PII never leak into memory. Detected secrets belong in your own secret manager, not the graph.
