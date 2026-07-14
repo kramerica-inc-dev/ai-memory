@@ -97,15 +97,25 @@ async def main():
             return 0
 
         # --replay
-        replayed = already = 0
+        replayed = already = skipped = 0
         for eid, f in sel:
+            grp = _group(f)
+            if grp == "?":
+                # No usable group_id (malformed legacy entry, e.g. degraded by an earlier
+                # replay round-trip). Re-enqueuing it would hand the consumer an empty
+                # group_id — the exact feeder of the select_graph('') crash
+                # (getzep/graphiti#1650). Keep it in the stream for manual triage.
+                print(f"  ! skipped {eid}: no usable group_id "
+                      f"(name={f.get('name', '?')[:50]!r}) — inspect, then --purge or fix by hand")
+                skipped += 1
+                continue
             key = f.get("key", "")
-            if key and await r.sismember(_processed_set(_group(f)), key):
+            if key and await r.sismember(_processed_set(grp), key):
                 await r.xdel(DEAD, eid)          # landed since it was parked -> just drop
                 already += 1
                 continue
             await r.xadd(QUEUE, {
-                "group_id": _group(f), "name": f.get("name", ""),
+                "group_id": grp, "name": f.get("name", ""),
                 "content": f.get("content", ""),
                 "source_description": f.get("source_description", ""),
                 "source": f.get("source", "text"), "uuid": f.get("uuid", ""),
@@ -113,7 +123,8 @@ async def main():
             })
             await r.xdel(DEAD, eid)
             replayed += 1
-        print(f"replayed {replayed} to {QUEUE}; dropped {already} already-processed. "
+        print(f"replayed {replayed} to {QUEUE}; dropped {already} already-processed"
+              + (f"; skipped {skipped} without usable group_id" if skipped else "") + ". "
               f"The consumer will drain them (single-writer, sanitizer, dead-letter still apply).")
         return 0
     finally:

@@ -214,10 +214,17 @@ async def ingest_batch(g, r, grp, batch, custom, now):
         reason = _classify_failure(msg)
         print(f"  [{grp}] batch FAIL: {type(exc).__name__}: {msg[:120]}")
         for rec in fresh:
-            await r.xadd(DEAD, {"group": grp, "name": rec["name"],
+            # Field shape mirrors queue_service_durable's queue entries (group_id, not
+            # group; source/uuid/attempt present), so dead_letter.py --replay re-enqueues
+            # a bulk casualty indistinguishably from a consumer casualty. A `group`-only
+            # entry used to replay without a usable group_id — the consumer then defaulted
+            # to '' and crashed on select_graph('') (getzep/graphiti#1650).
+            await r.xadd(DEAD, {"group_id": grp, "name": rec["name"],
                                 "content": rec["content"],
                                 "source_description": rec.get("source_description", ""),
-                                "key": _rec_key(rec), "error": msg[:400], "reason": reason,
+                                "source": "text", "uuid": "",
+                                "key": _rec_key(rec), "attempt": "0",
+                                "error": msg[:400], "reason": reason,
                                 "failed_at": datetime.now(timezone.utc).isoformat()})
         print(f"  [{grp}] dead-lettered {len(fresh)} record(s) (reason={reason})")
         return 0, 0, 0, len(fresh)

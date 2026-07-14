@@ -57,6 +57,30 @@ RUN /app/mcp/.venv/bin/python /tmp/patch-durable-queue.py
 COPY patch-dedupe-defaults.py /tmp/patch-dedupe-defaults.py
 RUN /app/mcp/.venv/bin/python /tmp/patch-dedupe-defaults.py
 
+# FALKORDB FULLTEXT HARDENING (failure class: "RediSearch: Syntax error ..."):
+# group_id escaping (backport of upstream PR #1549), empty/stopword-only guard
+# (upstream #1337/#1440) and backtick separator (#1440), applied to BOTH duplicated
+# fulltext builders. See the patch files' docstrings.
+COPY patch-falkor-fulltext-escape.py /tmp/patch-falkor-fulltext-escape.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-falkor-fulltext-escape.py
+COPY patch-falkor-fulltext-escape-driver.py /tmp/patch-falkor-fulltext-escape-driver.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-falkor-fulltext-escape-driver.py
+
+# EMPTY GRAPH NAME GUARD (failure class: "Expected a string parameter, but received
+# <class 'str'>"): an empty group_id must never reach falkordb-py's select_graph.
+# Upstream: getzep/graphiti#1650 + FalkorDB/falkordb-py#244 (both reported by us).
+COPY patch-falkor-empty-graphname.py /tmp/patch-falkor-empty-graphname.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-falkor-empty-graphname.py
+
+# EDGE FULLTEXT PERF (failure class: "Query timed out" on dense graphs): stop
+# re-MATCHing each fulltext hit by uuid (a per-hit label scan over all Entity nodes);
+# consume the hit via startNode()/endNode(). Upstream getzep/graphiti#1272. Patched in
+# the live generic path (search_utils.py) AND the dormant falkordb search-ops path.
+COPY patch-falkor-edge-fulltext-scan.py /tmp/patch-falkor-edge-fulltext-scan.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-falkor-edge-fulltext-scan.py
+COPY patch-falkor-edge-fulltext-scan-searchutils.py /tmp/patch-falkor-edge-fulltext-scan-searchutils.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-falkor-edge-fulltext-scan-searchutils.py
+
 # Optional LOCAL reranker via the infinity container's /rerank endpoint — removes the
 # unconditional OpenAI dependency of graphiti-core's default cross-encoder. Opt-in:
 # active only when RERANKER_URL is set (see docker-compose.yml + patch-reranker.py).

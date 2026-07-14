@@ -82,6 +82,21 @@ your provider; keep, adjust, or drop them:
   malformed `tool_use.input` on some Claude models, dropping episodes; `parse()` is schema-
   constrained. Falls back to the original path on error. See `patch-anthropic-client.py`.
 - **`reasoning='low'` for gpt-5-family** — some variants reject `'minimal'` (400).
+- **FalkorDB fulltext hardening** — group_id escaping (backport of upstream PR #1549), an
+  empty/stopword-only query guard (upstream #1337/#1440) and a backtick separator (#1440), in
+  BOTH duplicated fulltext builders; malformed RediSearch queries were dead-lettering episodes.
+  See `patch-falkor-fulltext-escape.py` (+ `-driver` sibling).
+- **Empty graph name guard** — an empty group_id built a driver whose first query crashed
+  falkordb-py's `select_graph('')` with a misleading TypeError (getzep/graphiti#1650 and
+  FalkorDB/falkordb-py#244, both reported by us). `clone()`/`_get_graph()` now fall back to the
+  driver's default database. See `patch-falkor-empty-graphname.py`. The ops-side feeder is also
+  fixed: `migrate/dead_letter.py --replay` skips entries without a usable group_id and
+  `migrate/bulk_ingest.py` dead-letters in the canonical field shape.
+- **Edge fulltext perf** — `edge_fulltext_search` re-MATCHed every fulltext hit by uuid (a
+  per-hit label scan over all Entity nodes, O(hits × nodes)), blowing past even multi-minute
+  query timeouts on dense graphs; hits are now consumed directly via `startNode()`/`endNode()`
+  (upstream #1272). See `patch-falkor-edge-fulltext-scan.py` (+ `-searchutils` sibling — the
+  path actually live in 0.28.2).
 
 ## Durability notes
 
