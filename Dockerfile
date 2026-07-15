@@ -87,3 +87,10 @@ RUN /app/mcp/.venv/bin/python /tmp/patch-falkor-edge-fulltext-scan-searchutils.p
 COPY infinity_reranker_client.py /app/mcp/src/infinity_reranker_client.py
 COPY patch-reranker.py /tmp/patch-reranker.py
 RUN /app/mcp/.venv/bin/python /tmp/patch-reranker.py
+
+# GROUP-GRAPH-AWARE EPISODE TOOLS (FalkorDB): get_episodes/delete_episode queried the
+# shared driver's current graph (default_db or last-written group) instead of the
+# requested group's graph, reporting existing episodes as missing. Reported upstream
+# as getzep/graphiti#1651; see patch-mcp-episode-tools.py.
+COPY patch-mcp-episode-tools.py /tmp/patch-mcp-episode-tools.py
+RUN /app/mcp/.venv/bin/python /tmp/patch-mcp-episode-tools.py

@@ -97,6 +97,12 @@ your provider; keep, adjust, or drop them:
   query timeouts on dense graphs; hits are now consumed directly via `startNode()`/`endNode()`
   (upstream #1272). See `patch-falkor-edge-fulltext-scan.py` (+ `-searchutils` sibling — the
   path actually live in 0.28.2).
+- **Group-graph-aware MCP episode tools (FalkorDB)** — `get_episodes`/`delete_episode`
+  queried the shared driver's current graph (default_db or the last-written group) instead of
+  the requested group's graph, reporting existing episodes as missing (reported upstream as
+  getzep/graphiti#1651). The handlers now clone the driver per group; `delete_episode` gains
+  an optional `group_id` and otherwise scans graphs for the uuid. See
+  `patch-mcp-episode-tools.py`.
 
 ## Durability notes
 
