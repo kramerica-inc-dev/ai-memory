@@ -50,7 +50,9 @@ fi
 
 # 2) timestamped copy + retention
 mkdir -p "\$DIR/backups"
-cp "\$DIR/data/falkordb/dump.rdb" "\$DIR/backups/dump-\$(date +%Y%m%d-%H%M%S).rdb"
+# Copy via the container, not the bind mount: FalkorDB 6.x runs redis as uid 999 and
+# writes dump.rdb mode 0600, so a non-root host user cannot read data/falkordb/ directly.
+"\$D" cp "\$FALKOR:/var/lib/falkordb/data/dump.rdb" "\$DIR/backups/dump-\$(date +%Y%m%d-%H%M%S).rdb"
 ls -1t "\$DIR"/backups/dump-*.rdb | tail -n +\$((KEEP+1)) | xargs -r rm -f
 
 echo "backup ok — latest snapshots:"

@@ -36,11 +36,13 @@ Fill in at minimum:
   endpoint; OpenAI-compatible),
 - a strong `FALKORDB_PASSWORD`.
 
-Pin images to a digest for reproducibility after the first pull:
+FalkorDB is pinned by tag + digest in `docker-compose.yml` / `.env.example` (`FALKORDB_IMAGE`).
+Never point it at `:latest`: that tag moved from the C engine (4.x) to the Rust engine (6.0.x) on
+2026-10-22, so an unplanned `docker compose pull` would swap engines under live data (see
+"FalkorDB 6.x (Rust engine): not yet" below). Pin other images the same way after the first pull:
 
 ```bash
 docker images --digests | grep -E 'falkordb|knowledge-graph-mcp'
-# put the falkordb digest into .env as FALKORDB_IMAGE
 ```
 
 ### `config/mapping.yaml` (the content layer)
@@ -151,6 +153,36 @@ Completions endpoint does not speak (404) — verify, or route via an OpenAI-com
   group closes the gap.
 - **Rate limits.** Free provider tiers have low RPM/day limits; under load you will see `429` and
   episodes drop. Lower `SEMAPHORE_LIMIT`, use a paid tier, or wait for the quota to reset.
+
+### FalkorDB 6.x (Rust engine): not yet
+
+Tested 2026-10-22: FalkorDB 6.0.3 (built from the `v6.0.3` tag) against a 4.x data dir, using
+graphiti-core 0.28.2 with this repo's patches. It fixes the stopword `IN` crash we reported
+(FalkorDB/FalkorDB#3348, still present in 4.22.1). A 4.x RDB loads with identical data and
+search results, and 4.x can read an RDB that 6.0.3 wrote, so rollback works. **But an AOF with
+C-engine `GRAPH.EFFECT` records does not load:** 6.0.3 shuts down ("effects buffer is version 2,
+this build reads 3"). With `--appendonly yes` that is our normal state, so before switching
+engines, stop graphiti-mcp, `BGREWRITEAOF` on 4.x and wait until the `*.incr.aof` file is empty.
+Three more 6.0.3 defects break graphiti's schema, so we stay on the pinned 4.x image for now:
+
+1. **Fulltext index creation is a no-op.** `db.idx.fulltext.createNodeIndex` is a stub that
+   rejects graphiti's `({label, stopwords}, 'prop', ...)` form ("expected at most 1"). Because
+   `build_indices_and_constraints` runs its DDL in sequence, the first failure stops it: a **new
+   group** gets no fulltext index at all, and its searches come back (nearly) empty.
+2. **Loading a 4.x RDB drops RANGE indexes on properties that also have a FULLTEXT index**
+   (`name`/`group_id` on Entity, Episodic and RELATES_TO). Re-running graphiti's DDL does not bring
+   them back; an explicit `CREATE INDEX FOR (n:Entity) ON (n.name, n.group_id)` does.
+3. **RANGE + FULLTEXT-with-stopwords on the same property gives wrong results.** Equality and
+   `IN` lookups through that range index return 0 rows (4.x returns the right row). That is exactly
+   graphiti's schema, so repairing (2) or working around (1) with `CREATE FULLTEXT INDEX ...
+   OPTIONS {stopwords: [...]}` turns `group_id`/`name` filters silently empty.
+
+Re-test when a 6.0.x release fixes these. The upgrade itself is then: stop graphiti-mcp,
+`BGREWRITEAOF` on 4.x (empty `*.incr.aof`), back up `data/falkordb/`, pin the new digest,
+recreate the container, check the indexes with `CALL db.indexes()`, then start graphiti-mcp.
+Rollback means restoring that backup. Note that the 6.x
+image runs redis as uid 999 and writes RDB/AOF mode 0600. The backup scripts already copy via
+`docker cp`, so they keep working.
 
 ## Backup & retention
 
