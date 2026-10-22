@@ -13,8 +13,10 @@
 
 services:
   falkordb:
-    # Pin to a digest after the first pull — see docs/DEPLOY.md (FALKORDB_IMAGE in .env).
-    image: ${FALKORDB_IMAGE:-falkordb/falkordb:latest}
+    # Pinned to the C engine (4.x). Never track :latest — it moved to the Rust engine (6.0.x) on
+    # 2026-10-22, and 6.0.3 is not yet compatible with graphiti-core 0.28.2's schema: see
+    # docs/DEPLOY.md ("FalkorDB 6.x (Rust engine): not yet").
+    image: ${FALKORDB_IMAGE:-falkordb/falkordb:v4.18.11@sha256:2496643cabd67e87fd82458383400c049324daec1fe674ba0db4c5bdaca5d25f}
     restart: unless-stopped
     environment:
       # FalkorDB enforces the password via standard redis (the image does not honor FALKORDB_PASSWORD itself)
